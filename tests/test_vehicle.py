@@ -142,6 +142,26 @@ class TestParallelUpdate:
         assert auth.get_tripdata.await_count == 2
 
     @pytest.mark.asyncio
+    async def test_update_retains_raw_vehicle_data(self):
+        raw = {
+            "measurements": {
+                "odometerStatus": {
+                    "value": {
+                        "carCapturedTimestamp": "2026-08-16T19:32:43Z",
+                        "odometer": 957,
+                    }
+                }
+            }
+        }
+        auth = _make_auth_mock()
+        auth.get_stored_vehicle_data = AsyncMock(return_value=raw)
+
+        v = _make_vehicle(auth=auth)
+        await v.update()
+
+        assert v.raw_vehicle_data is raw
+
+    @pytest.mark.asyncio
     async def test_update_continues_on_partial_failure(self):
         auth = _make_auth_mock()
         auth.get_stored_vehicle_data = AsyncMock(side_effect=Exception("fail"))
