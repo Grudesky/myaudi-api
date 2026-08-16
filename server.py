@@ -53,6 +53,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -96,6 +97,13 @@ TOKEN_REFRESH_INTERVAL = 45 * 60
 
 # Cache vehicle data to avoid hammering Audi's API (default: 4 hours)
 DATA_CACHE_TTL = int(os.getenv("AUDI_CACHE_TTL", "14400"))
+LIVE_POLL_MIN_INTERVAL = int(os.getenv("AUDI_LIVE_POLL_MIN_INTERVAL", "600"))
+LIVE_POLL_STATE_FILE = Path(
+    os.getenv(
+        "AUDI_LIVE_POLL_STATE_FILE",
+        "/Users/admin/myAudi/data/myaudi-live-poll-state.json",
+    )
+)
 
 # Webhook URL for state change notifications (optional)
 WEBHOOK_URL = os.getenv("AUDI_WEBHOOK_URL")
@@ -206,7 +214,37 @@ class AudiClient:
         self._auth_time = 0.0
         self._auth_lock = asyncio.Lock()
         self._last_update = 0.0
+        self._last_live_poll = 0.0
         self._update_lock = asyncio.Lock()
+
+    def _load_live_poll_state(self) -> None:
+        """Restore the last successful live-poll time from disk."""
+        try:
+            data = json.loads(LIVE_POLL_STATE_FILE.read_text())
+            self._last_live_poll = float(data["last_live_poll"])
+            log.info(
+                "Restored live-poll cooldown state: %s",
+                datetime.fromtimestamp(
+                    self._last_live_poll,
+                    tz=ZoneInfo("UTC"),
+                ).isoformat(),
+            )
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            log.warning("Could not restore live-poll state: %s", e)
+
+    def _save_live_poll_state(self) -> None:
+        """Persist the last successful live-poll time to disk."""
+        LIVE_POLL_STATE_FILE.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+        LIVE_POLL_STATE_FILE.write_text(
+            json.dumps(
+                {"last_live_poll": self._last_live_poll}
+            )
+        )
 
     def _needs_refresh(self) -> bool:
         if not self.authenticated:
@@ -297,6 +335,32 @@ class AudiClient:
             self._last_update = time.time()
             audi_backend_request_duration_seconds.labels(endpoint="update").observe(time.time() - t0)
             log.info("Vehicle data cached for %ds", DATA_CACHE_TTL)
+
+    async def live_update_vehicles(self) -> tuple[bool, float]:
+        """Perform a real Audi update if the live-poll cooldown has elapsed.
+
+        Returns (updated, retry_after_seconds).
+        """
+        async with self._update_lock:
+            now = time.time()
+            if self._last_live_poll:
+                elapsed = now - self._last_live_poll
+                if elapsed < LIVE_POLL_MIN_INTERVAL:
+                    return False, LIVE_POLL_MIN_INTERVAL - elapsed
+
+            t0 = time.time()
+            log.info("Performing live Audi vehicle status update...")
+            for vehicle in self.vehicles:
+                await vehicle._fetch_vehicle_data(raise_on_error=True)
+
+            completed = time.time()
+            self._last_live_poll = completed
+            self._last_update = completed
+            self._save_live_poll_state()
+            audi_backend_request_duration_seconds.labels(endpoint="live_update").observe(
+                completed - t0
+            )
+            return True, 0.0
 
     def invalidate_cache(self) -> None:
         """Force next update_vehicles() call to refresh data."""
@@ -442,6 +506,7 @@ async def _background_watcher() -> None:
 async def lifespan(app: FastAPI):
     """Login on startup, start watcher if configured, close on shutdown."""
     global _watcher_task
+    client._load_live_poll_state()
     if not AUDI_USERNAME or not AUDI_PASSWORD:
         log.error("AUDI_USERNAME and AUDI_PASSWORD env vars are required")
     else:
@@ -566,13 +631,39 @@ async def list_vehicles(request: Request):
 @limiter.limit("30/minute")
 async def get_status(request: Request, vin: Optional[str] = Query(None, description="Filter by VIN")):
     await _require_auth()
-    await client.update_vehicles()
+
+    updated, retry_after = await client.live_update_vehicles()
+
+    if not updated:
+        retry_after_seconds = max(1, int(retry_after + 0.999))
+        last_live_poll = client._last_live_poll
+        next_live_poll = last_live_poll + LIVE_POLL_MIN_INTERVAL
+
+        return JSONResponse(
+            status_code=429,
+            headers={"Retry-After": str(retry_after_seconds)},
+            content={
+                "status": "refresh_blocked",
+                "reason": "live_poll_cooldown",
+                "last_live_poll": datetime.fromtimestamp(
+                    last_live_poll, tz=ZoneInfo("UTC")
+                ).isoformat(),
+                "next_live_poll": datetime.fromtimestamp(
+                    next_live_poll, tz=ZoneInfo("UTC")
+                ).isoformat(),
+                "retry_after_seconds": retry_after_seconds,
+            },
+        )
 
     vehicles = client.vehicles
     if vin:
         vehicles = [_get_vehicle_or_404(vin)]
 
     return {
+        "status": "live",
+        "live_poll_at": datetime.fromtimestamp(
+            client._last_live_poll, tz=ZoneInfo("UTC")
+        ).isoformat(),
         "count": len(vehicles),
         "vehicles": [
             {"vin": v.vin, "model": v.model, "title": v.title, **v.get_dashboard()}

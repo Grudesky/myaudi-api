@@ -57,6 +57,7 @@ class AudiVehicle:
 
         # Data storage
         self._vehicle_data: Optional[VehicleDataResponse] = None
+        self._raw_vehicle_data: Optional[dict] = None
         self._position: Optional[dict] = None
         self._position_failed: bool = False
         self._trip_shortterm: Optional[TripDataResponse] = None
@@ -77,12 +78,15 @@ class AudiVehicle:
             if isinstance(result, Exception):
                 _LOGGER.error("Fetch task %d failed: %s", i, result)
 
-    async def _fetch_vehicle_data(self) -> None:
+    async def _fetch_vehicle_data(self, raise_on_error: bool = False) -> None:
         try:
             raw_data = await self._auth.get_stored_vehicle_data(self.vin)
+            self._raw_vehicle_data = raw_data
             self._vehicle_data = VehicleDataResponse(raw_data)
         except Exception as e:
             _LOGGER.error("Failed to get vehicle data: %s", e)
+            if raise_on_error:
+                raise
 
     async def _fetch_position(self) -> None:
         try:
@@ -114,6 +118,10 @@ class AudiVehicle:
 
     def _get_legacy_access_field(self, name: str) -> Optional[object]:
         return self._vehicle_data.get_legacy_access_field(name) if self._vehicle_data else None
+
+    @property
+    def raw_vehicle_data(self) -> Optional[dict]:
+        return self._raw_vehicle_data
 
     # --- Vehicle info ---
 
