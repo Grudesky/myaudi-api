@@ -58,6 +58,7 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 import aiohttp
+from aiohttp import ClientResponseError
 import certifi
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
@@ -367,8 +368,26 @@ class AudiClient:
 
             t0 = time.time()
             log.info("Performing live Audi vehicle status update...")
-            for vehicle in self.vehicles:
-                await vehicle._fetch_vehicle_data(raise_on_error=True)
+
+            try:
+                for vehicle in self.vehicles:
+                    await vehicle._fetch_vehicle_data(raise_on_error=True)
+                    await vehicle._fetch_position()
+            except ClientResponseError as e:
+                if e.status != 401:
+                    raise
+
+                log.warning(
+                    "Audi live status returned 401; refreshing authentication and retrying once"
+                )
+
+                self._auth_time = 0.0
+                if not await self.ensure_auth():
+                    raise
+
+                for vehicle in self.vehicles:
+                    await vehicle._fetch_vehicle_data(raise_on_error=True)
+                    await vehicle._fetch_position()
 
             completed = time.time()
             self._last_live_poll = completed

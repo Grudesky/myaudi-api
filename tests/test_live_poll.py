@@ -11,6 +11,7 @@ async def test_live_update_performs_fetch_and_sets_timestamp(monkeypatch):
     client = api_module.AudiClient()
     vehicle = MagicMock()
     vehicle._fetch_vehicle_data = AsyncMock(return_value=None)
+    vehicle._fetch_position = AsyncMock(return_value=None)
     client.vehicles = [vehicle]
 
     updated, retry_after = await client.live_update_vehicles()
@@ -61,3 +62,33 @@ def test_live_poll_state_round_trip(tmp_path, monkeypatch):
     restored._load_live_poll_state()
 
     assert restored._last_live_poll == 1234567890.5
+
+@pytest.mark.asyncio
+async def test_live_update_reauthenticates_once_after_401(monkeypatch):
+    client = api_module.AudiClient()
+
+    error_401 = api_module.ClientResponseError(
+        request_info=MagicMock(),
+        history=(),
+        status=401,
+        message="Unauthorized",
+    )
+
+    vehicle = MagicMock()
+    vehicle._fetch_vehicle_data = AsyncMock(
+        side_effect=[error_401, None]
+    )
+    vehicle._fetch_position = AsyncMock(return_value=None)
+    client.vehicles = [vehicle]
+
+    ensure_auth = AsyncMock(return_value=True)
+    monkeypatch.setattr(client, "ensure_auth", ensure_auth)
+    monkeypatch.setattr(client, "_save_live_poll_state", MagicMock())
+
+    updated, retry_after = await client.live_update_vehicles()
+
+    assert updated is True
+    assert retry_after == 0.0
+    assert vehicle._fetch_vehicle_data.await_count == 2
+    ensure_auth.assert_awaited_once()
+    assert client._last_live_poll > 0

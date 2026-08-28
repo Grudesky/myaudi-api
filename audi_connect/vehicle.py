@@ -60,6 +60,7 @@ class AudiVehicle:
         self._raw_vehicle_data: Optional[dict] = None
         self._position: Optional[dict] = None
         self._position_failed: bool = False
+        self._position_fetched: bool = False
         self._trip_shortterm: Optional[TripDataResponse] = None
         self._trip_longterm: Optional[TripDataResponse] = None
 
@@ -92,10 +93,12 @@ class AudiVehicle:
         try:
             self._position = await self._auth.get_stored_position(self.vin)
             self._position_failed = False
+            self._position_fetched = True
         except Exception as e:
             _LOGGER.debug("Failed to get position (may be moving): %s", e)
             self._position = None
             self._position_failed = True
+            self._position_fetched = True
 
     async def _fetch_trip(self, kind: str) -> None:
         try:
@@ -171,8 +174,12 @@ class AudiVehicle:
 
     @property
     def is_moving(self) -> bool:
-        """True only when position is unavailable and the fetch didn't error out."""
-        return self._position is None and not self._position_failed
+        """True only after a position fetch explicitly returned no position."""
+        return (
+            self._position_fetched
+            and self._position is None
+            and not self._position_failed
+        )
 
     # --- Doors and locks ---
 

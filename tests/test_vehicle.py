@@ -655,6 +655,7 @@ class TestBrief:
         v = _make_vehicle()
         v._position = None
         v._position_failed = False
+        v._position_fetched = True
         brief = v.get_brief()
         assert brief["position"] == "Vehicle is moving"
 
@@ -792,3 +793,11 @@ class TestActionRetryPolicy:
         v = _make_vehicle(auth=auth)
         await v.stop_preheater()
         assert auth.stop_preheater.await_count == 3
+
+def test_not_moving_before_position_has_ever_been_fetched():
+    v = _make_vehicle()
+    v._position = None
+    v._position_failed = False
+    v._position_fetched = False
+
+    assert v.is_moving is False
