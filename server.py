@@ -102,7 +102,7 @@ LIVE_POLL_MIN_INTERVAL = int(os.getenv("AUDI_LIVE_POLL_MIN_INTERVAL", "600"))
 LIVE_POLL_STATE_FILE = Path(
     os.getenv(
         "AUDI_LIVE_POLL_STATE_FILE",
-        "/Users/admin/myAudi/data/myaudi-live-poll-state.json",
+        str(Path.home() / ".myaudi-api" / "live-poll-state.json"),
     )
 )
 
