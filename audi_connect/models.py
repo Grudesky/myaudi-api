@@ -60,6 +60,7 @@ class VehicleDataResponse:
     def __init__(self, data: dict):
         self.data_fields: list["Field"] = []
         self.states: list[dict] = []
+        self.capability_ids: tuple[str, ...] = self._capability_ids(data)
         self._fields_by_name: dict[str, "Field"] = {}
         self._legacy_access_fields_by_name: dict[str, "Field"] = {}
         self._states_by_name: dict[str, dict] = {}
@@ -127,6 +128,25 @@ class VehicleDataResponse:
     def get_legacy_access_field(self, name: str) -> Optional["Field"]:
         """Return the compatibility view used by pre-structured access helpers."""
         return self._legacy_access_fields_by_name.get(name)
+
+    @staticmethod
+    def _capability_ids(data: dict) -> tuple[str, ...]:
+        """Return advertised capability identifiers without interpreting them."""
+        capabilities = get_attr(
+            data,
+            "userCapabilities.capabilitiesStatus.value",
+            [],
+        )
+        if not isinstance(capabilities, list):
+            return ()
+
+        return tuple(
+            capability_id
+            for item in capabilities
+            if isinstance(item, dict)
+            and isinstance((capability_id := item.get("id")), str)
+            and capability_id
+        )
 
     def _get_from_json(self, json_data: dict, loc: list[str]) -> Any:
         child = json_data

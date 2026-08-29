@@ -90,7 +90,7 @@ class AudiVehicleClient:
             "departureTimers", "fuelStatus", "honkAndFlash",
             "hybridCarAuxiliaryHeating", "lvBattery", "measurements", "oilLevel",
             "readiness", "vehicleHealthInspection", "vehicleHealthWarnings",
-            "vehicleLights",
+            "vehicleLights", "userCapabilities",
         }
         self._api.use_token(self._bearer_token)
         return await self._api.get(

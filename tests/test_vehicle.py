@@ -151,7 +151,21 @@ class TestParallelUpdate:
                         "odometer": 957,
                     }
                 }
-            }
+            },
+            "userCapabilities": {
+                "capabilitiesStatus": {
+                    "value": [
+                        {
+                            "id": "engineType",
+                            "status": [2001],
+                            "expirationDate": "2035-06-10T23:59:59Z",
+                            "userDisablingAllowed": False,
+                        },
+                        {"id": "ignition", "userDisablingAllowed": False},
+                        {"id": "readiness", "userDisablingAllowed": False},
+                    ]
+                }
+            },
         }
         auth = _make_auth_mock()
         auth.get_stored_vehicle_data = AsyncMock(return_value=raw)
@@ -160,6 +174,9 @@ class TestParallelUpdate:
         await v.update()
 
         assert v.raw_vehicle_data is raw
+        assert v.raw_vehicle_data["userCapabilities"] == raw["userCapabilities"]
+        assert v.capability_ids == ("engineType", "ignition", "readiness")
+        assert "capabilities" not in v.get_dashboard()
 
     @pytest.mark.asyncio
     async def test_update_continues_on_partial_failure(self):

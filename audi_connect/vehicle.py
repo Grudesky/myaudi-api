@@ -126,6 +126,11 @@ class AudiVehicle:
     def raw_vehicle_data(self) -> Optional[dict]:
         return self._raw_vehicle_data
 
+    @property
+    def capability_ids(self) -> tuple[str, ...]:
+        """Literal capability IDs advertised by CARIAD, without support inference."""
+        return self._vehicle_data.capability_ids if self._vehicle_data else ()
+
     # --- Vehicle info ---
 
     @property

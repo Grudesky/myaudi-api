@@ -39,6 +39,28 @@ async def test_live_update_blocks_during_cooldown(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_capability_fetch_uses_existing_live_poll_and_preserves_cooldown(monkeypatch):
+    client = api_module.AudiClient()
+    vehicle = MagicMock()
+    vehicle._fetch_vehicle_data = AsyncMock(return_value=None)
+    vehicle._fetch_position = AsyncMock(return_value=None)
+    client.vehicles = [vehicle]
+    monkeypatch.setattr(client, "_save_live_poll_state", MagicMock())
+
+    updated, retry_after = await client.live_update_vehicles()
+    completed_at = client._last_live_poll
+    blocked, blocked_retry_after = await client.live_update_vehicles()
+
+    assert updated is True
+    assert retry_after == 0.0
+    assert blocked is False
+    assert 0 < blocked_retry_after <= api_module.LIVE_POLL_MIN_INTERVAL
+    assert client._last_live_poll == completed_at
+    vehicle._fetch_vehicle_data.assert_awaited_once_with(raise_on_error=True)
+    vehicle._fetch_position.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
 async def test_forced_live_update_bypasses_cooldown(monkeypatch):
     client = api_module.AudiClient()
     vehicle = MagicMock()

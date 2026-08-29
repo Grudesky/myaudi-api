@@ -109,7 +109,19 @@ class TestClientIntegration:
                         "carCapturedTimestamp": "2024-06-15T10:00:00Z",
                     }
                 }
-            }
+            },
+            "userCapabilities": {
+                "capabilitiesStatus": {
+                    "value": [
+                        {
+                            "id": "ignition",
+                            "expirationDate": "2035-06-10T23:59:59Z",
+                            "userDisablingAllowed": False,
+                        },
+                        {"id": "readiness", "userDisablingAllowed": False},
+                    ]
+                }
+            },
         }
 
         with aioresponses() as m:
@@ -120,7 +132,20 @@ class TestClientIntegration:
             )
             result = await client.get_stored_vehicle_data("wautest")
 
+            request_calls = [
+                request
+                for request_group in m.requests.values()
+                for request in request_group
+            ]
+            request_keys = list(m.requests)
+
         assert result["fuelStatus"]["rangeStatus"]["value"]["totalRange_km"] == 450
+        assert result["userCapabilities"] == vehicle_data["userCapabilities"]
+        assert len(request_calls) == 1
+        assert len(request_keys) == 1
+        requested_url = str(request_keys[0][1])
+        assert "/selectivestatus?jobs=" in requested_url
+        assert "userCapabilities" in requested_url
 
     @pytest.mark.asyncio
     async def test_get_stored_position(self, client):
