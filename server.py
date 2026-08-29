@@ -17,6 +17,11 @@ Endpoints:
   POST /{vin}/climate/stop  Stop climate control
   POST /{vin}/heater/start  Start auxiliary heater
   POST /{vin}/heater/stop   Stop auxiliary heater
+  POST /{vin}/engine/start  Start gasoline engine
+  POST /{vin}/engine/stop   Stop gasoline engine
+  GET  /{vin}/actions/{id}  Query engine action status
+  GET  /{vin}/engine/action Inspect unresolved engine action
+  POST /{vin}/engine/actions/{id}/recover  Explicitly release unresolved guard
 
 Requires: pip install fastapi uvicorn aiohttp beautifulsoup4 certifi tenacity
 """
@@ -71,10 +76,17 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from audi_connect.api import AudiAPI
 from audi_connect.auth import AudiAuth
+from audi_connect.engine_actions import EngineActionStore
 from audi_connect.vehicle import AudiVehicle
 from audi_connect.watcher import check_vehicles
 from audi_connect.exceptions import (
+    ActionInProgressError,
+    ActionNotFoundError,
+    ActionPersistenceError,
+    AmbiguousActionError,
     AudiConnectError,
+    CapabilityNotSupportedError,
+    InvalidActionRequestError,
     SpinRequiredError,
 )
 
@@ -104,6 +116,10 @@ LIVE_POLL_STATE_FILE = Path(
         "AUDI_LIVE_POLL_STATE_FILE",
         str(Path.home() / ".myaudi-api" / "live-poll-state.json"),
     )
+)
+_engine_action_state_path = os.getenv("AUDI_ENGINE_ACTION_STATE_FILE")
+ENGINE_ACTION_STATE_FILE = (
+    Path(_engine_action_state_path) if _engine_action_state_path else None
 )
 
 # Webhook URL for state change notifications (optional)
@@ -217,6 +233,14 @@ class AudiClient:
         self._last_update = 0.0
         self._last_live_poll = 0.0
         self._update_lock = asyncio.Lock()
+        # The API server has no safe default: its container filesystem may be
+        # ephemeral. Engine commands remain disabled until an operator supplies
+        # a path backed by durable storage.
+        self._engine_action_store = (
+            EngineActionStore(ENGINE_ACTION_STATE_FILE)
+            if ENGINE_ACTION_STATE_FILE is not None
+            else None
+        )
 
     def _load_live_poll_state(self) -> None:
         """Restore the last successful live-poll time from disk."""
@@ -316,7 +340,14 @@ class AudiClient:
             vehicle_list = await self._auth.login(
                 AUDI_USERNAME, AUDI_PASSWORD, on_verification=_on_verification
             )
-            self.vehicles = [AudiVehicle(self._auth, v) for v in vehicle_list]
+            self.vehicles = [
+                AudiVehicle(
+                    self._auth,
+                    v,
+                    engine_action_store=self._engine_action_store,
+                )
+                for v in vehicle_list
+            ]
 
             self.authenticated = True
             self._auth_time = time.time()
@@ -908,6 +939,147 @@ async def stop_heater(request: Request, vin: str, confirm: bool = Query(False)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# --- Remote gasoline engine control ---
+@app.post("/{vin}/engine/start", dependencies=[Depends(require_api_key)])
+@limiter.limit("5/minute")
+async def start_engine(request: Request, vin: str):
+    await _require_auth()
+    vehicle = _get_vehicle_or_404(vin)
+    try:
+        request_id = await _track_action(
+            "engine_start",
+            vehicle,
+            vehicle.start_engine(),
+        )
+        return {
+            "status": "sent",
+            "action": "engine_start",
+            "vin": vehicle.vin,
+            "request_id": request_id,
+        }
+    except SpinRequiredError:
+        raise HTTPException(status_code=400, detail="S-PIN not configured")
+    except CapabilityNotSupportedError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except ActionInProgressError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except ActionPersistenceError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except AmbiguousActionError as exc:
+        return JSONResponse(
+            status_code=502,
+            content={
+                "status": "unknown",
+                "action": "engine_start",
+                "vin": vehicle.vin,
+                "detail": str(exc),
+            },
+        )
+    except AudiConnectError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/{vin}/engine/stop", dependencies=[Depends(require_api_key)])
+@limiter.limit("5/minute")
+async def stop_engine(request: Request, vin: str):
+    await _require_auth()
+    vehicle = _get_vehicle_or_404(vin)
+    try:
+        request_id = await _track_action(
+            "engine_stop",
+            vehicle,
+            vehicle.stop_engine(),
+        )
+        return {
+            "status": "sent",
+            "action": "engine_stop",
+            "vin": vehicle.vin,
+            "request_id": request_id,
+        }
+    except CapabilityNotSupportedError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except ActionInProgressError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except ActionPersistenceError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except AmbiguousActionError as exc:
+        return JSONResponse(
+            status_code=502,
+            content={
+                "status": "unknown",
+                "action": "engine_stop",
+                "vin": vehicle.vin,
+                "detail": str(exc),
+            },
+        )
+    except AudiConnectError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/{vin}/actions/{request_id}", dependencies=[Depends(require_api_key)])
+@limiter.limit("30/minute")
+async def get_engine_action(request: Request, vin: str, request_id: str):
+    await _require_auth()
+    vehicle = _get_vehicle_or_404(vin)
+    try:
+        result = await vehicle.get_engine_action_status(request_id)
+        return {**result, "vin": vehicle.vin}
+    except InvalidActionRequestError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except ActionNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ActionPersistenceError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+
+@app.get("/{vin}/engine/action", dependencies=[Depends(require_api_key)])
+@limiter.limit("30/minute")
+async def get_active_engine_action(request: Request, vin: str):
+    """Return the secret-free durable guard used for operator recovery."""
+    await _require_auth()
+    vehicle = _get_vehicle_or_404(vin)
+    return {
+        "vin": vehicle.vin,
+        "active_action": vehicle.active_engine_action,
+    }
+
+
+@app.post(
+    "/{vin}/engine/actions/{local_action_id}/recover",
+    dependencies=[Depends(require_api_key)],
+)
+@limiter.limit("5/minute")
+async def recover_engine_action(
+    request: Request,
+    vin: str,
+    local_action_id: str,
+    confirm: bool = Query(False),
+):
+    """Explicitly clear an unresolved guard without contacting the vehicle."""
+    if not confirm:
+        raise HTTPException(
+            status_code=400,
+            detail="Explicit confirm=true is required to recover an engine action",
+        )
+    await _require_auth()
+    vehicle = _get_vehicle_or_404(vin)
+    try:
+        recovered = await vehicle.recover_engine_action(local_action_id)
+        return {
+            "status": "operator_recovered",
+            "vin": vehicle.vin,
+            "action": recovered["action"],
+            "local_action_id": recovered["local_action_id"],
+            "request_id": recovered.get("request_id"),
+        }
+    except InvalidActionRequestError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except ActionNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ActionPersistenceError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+
 async def _confirm_action(vehicle: AudiVehicle, check_field: Optional[str], expected_value: Optional[str]) -> dict:
     """Wait a few seconds, re-fetch vehicle data via the cache-coordinated path,
     and check if the action was applied. Goes through client.update_vehicles()
@@ -931,13 +1103,14 @@ async def _track_action(action: str, vehicle: AudiVehicle, coro):
     """Wrap an action coroutine to emit Prometheus metrics."""
     t0 = time.time()
     try:
-        await coro
+        result = await coro
     except Exception:
         audi_action_total.labels(action=action, result="failure").inc()
         raise
     finally:
         audi_backend_request_duration_seconds.labels(endpoint=action).observe(time.time() - t0)
     audi_action_total.labels(action=action, result="success").inc()
+    return result
 
 
 # ---------------------------------------------------------------------------

@@ -4,7 +4,7 @@ import json
 import logging
 import asyncio
 from typing import Any, Optional, Union
-from asyncio import TimeoutError, CancelledError
+from asyncio import TimeoutError
 from aiohttp import ClientSession, ClientResponse, ClientResponseError
 from aiohttp.hdrs import METH_GET
 
@@ -53,6 +53,51 @@ class AudiAPI:
         rsp_wtxt: bool = False,
         **kwargs: Any,
     ) -> Union[dict, bytes, ClientResponse, tuple[ClientResponse, str]]:
+        return await self._request_once(
+            method,
+            url,
+            data,
+            headers=headers,
+            raw_reply=raw_reply,
+            raw_contents=raw_contents,
+            rsp_wtxt=rsp_wtxt,
+            **kwargs,
+        )
+
+    async def request_once(
+        self,
+        method: str,
+        url: str,
+        data: Any,
+        headers: Optional[dict] = None,
+        raw_reply: bool = False,
+        raw_contents: bool = False,
+        rsp_wtxt: bool = False,
+        **kwargs: Any,
+    ) -> Union[dict, bytes, ClientResponse, tuple[ClientResponse, str]]:
+        """Perform exactly one HTTP attempt for non-idempotent actions."""
+        return await self._request_once(
+            method,
+            url,
+            data,
+            headers=headers,
+            raw_reply=raw_reply,
+            raw_contents=raw_contents,
+            rsp_wtxt=rsp_wtxt,
+            **kwargs,
+        )
+
+    async def _request_once(
+        self,
+        method: str,
+        url: str,
+        data: Any,
+        headers: Optional[dict] = None,
+        raw_reply: bool = False,
+        raw_contents: bool = False,
+        rsp_wtxt: bool = False,
+        **kwargs: Any,
+    ) -> Union[dict, bytes, ClientResponse, tuple[ClientResponse, str]]:
         try:
             async with asyncio.timeout(TIMEOUT):
                 async with self._session.request(
@@ -80,8 +125,6 @@ class AudiAPI:
                             message=response.reason,
                         )
 
-        except CancelledError:
-            raise RequestTimeoutError(f"Request cancelled/timed out: {url}")
         except TimeoutError:
             raise RequestTimeoutError(f"Request timed out after {TIMEOUT}s: {url}")
 

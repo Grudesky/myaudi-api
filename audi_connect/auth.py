@@ -2,6 +2,7 @@
 
 import logging
 import time
+from collections.abc import Callable
 from typing import Optional
 
 from .api import AudiAPI
@@ -126,6 +127,23 @@ class AudiAuth:
 
     async def stop_preheater(self, vin: str) -> None:
         await self.actions.stop_preheater(vin)
+
+    async def start_engine(
+        self,
+        vin: str,
+        on_submission_begin: Optional[Callable[[], None]] = None,
+    ) -> str:
+        return await self.actions.start_engine(vin, on_submission_begin)
+
+    async def stop_engine(
+        self,
+        vin: str,
+        on_submission_begin: Optional[Callable[[], None]] = None,
+    ) -> str:
+        return await self.actions.stop_engine(vin, on_submission_begin)
+
+    async def get_engine_action_status(self, vin: str, request_id: str) -> dict:
+        return await self.actions.get_engine_action_status(vin, request_id)
 
     # --- Token persistence ---
 

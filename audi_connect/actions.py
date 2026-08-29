@@ -1,13 +1,23 @@
 """Vehicle actions - lock, unlock, climate control, preheater, charge mode."""
 
+import asyncio
 import json
 import logging
+import re
+from collections.abc import Callable
 from hashlib import sha512
 from typing import Optional
 
+from aiohttp import ClientResponseError
+
 from .api import AudiAPI
 from .endpoints import AudiEndpoints
-from .exceptions import SpinRequiredError
+from .exceptions import (
+    ActionFailedError,
+    AmbiguousActionError,
+    RequestTimeoutError,
+    SpinRequiredError,
+)
 from .utils import to_byte_array
 
 _LOGGER = logging.getLogger(__name__)
@@ -175,6 +185,196 @@ class AudiVehicleActions:
             self._endpoints.cariad_url_for_vin(vin, "auxiliaryheating/stop"),
             headers=headers, data=None,
         )
+
+    async def start_engine(
+        self,
+        vin: str,
+        on_submission_begin: Optional[Callable[[], None]] = None,
+    ) -> str:
+        """Submit a CARIAD remote engine-start command and return its request ID."""
+        if self._spin is None:
+            raise SpinRequiredError("S-PIN is required for remote engine start")
+
+        headers = self._get_engine_action_headers()
+        # Proof issuance has no established retry semantics. Use one application-
+        # level attempt and never progress to the command POST on any failure.
+        try:
+            proof_response = await self._api.request_once(
+                "PUT",
+                self._endpoints.cariad_url(
+                    "/vehicle/v1/engine/{vin}/userpromptproof",
+                    vin=vin.upper(),
+                ),
+                headers=headers,
+                data=json.dumps({"spin": self._spin}),
+                allow_redirects=False,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise ActionFailedError(
+                "Could not obtain remote engine-start authorization proof"
+            ) from exc
+        user_prompt_proof = (
+            proof_response.get("userPromptProof")
+            if isinstance(proof_response, dict)
+            else None
+        )
+        if not user_prompt_proof:
+            raise ActionFailedError(
+                "Audi did not return the engine-start authorization proof"
+            )
+
+        if on_submission_begin is not None:
+            # Synchronous by design: persist immediately before the first await
+            # that can transmit the non-idempotent command.
+            on_submission_begin()
+
+        try:
+            response = await self._api.request_once(
+                "POST",
+                self._endpoints.cariad_url(
+                    "/vehicle/v1/engine/{vin}/start",
+                    vin=vin.upper(),
+                ),
+                headers=headers,
+                data=json.dumps(
+                    {
+                        "securedActivationData": user_prompt_proof,
+                        "spin": self._spin,
+                    }
+                ),
+                allow_redirects=False,
+            )
+            return self._engine_request_id(response, "engine-start")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # CARIAD does not document any post-submission HTTP response as proof
+            # that the command was rejected before enqueueing. Fail closed.
+            raise AmbiguousActionError(
+                "Remote engine-start submission outcome is unknown"
+            ) from exc
+
+    async def stop_engine(
+        self,
+        vin: str,
+        on_submission_begin: Optional[Callable[[], None]] = None,
+    ) -> str:
+        """Submit one CARIAD remote engine-stop command and return its request ID.
+
+        Stop is deliberately not retried: its transport-level retry safety has not
+        been established independently from its apparently idempotent end state.
+        """
+        if on_submission_begin is not None:
+            on_submission_begin()
+
+        try:
+            response = await self._api.request_once(
+                "POST",
+                self._endpoints.cariad_url(
+                    "/vehicle/v1/engine/{vin}/stop",
+                    vin=vin.upper(),
+                ),
+                headers=self._get_engine_action_headers(),
+                data=None,
+                allow_redirects=False,
+            )
+            return self._engine_request_id(response, "engine-stop")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise AmbiguousActionError(
+                "Remote engine-stop submission outcome is unknown"
+            ) from exc
+
+    async def get_engine_action_status(self, vin: str, request_id: str) -> dict:
+        """Look up one CARIAD pending request and map its state without polling status."""
+        try:
+            response = await self._api.request(
+                "GET",
+                self._endpoints.cariad_url_for_vin(vin, "pendingrequests"),
+                headers=self._get_engine_action_headers(),
+                data=None,
+            )
+        except (RequestTimeoutError, ConnectionError, OSError, ClientResponseError):
+            return {
+                "status": "unknown",
+                "request_id": request_id,
+                "upstream_status": None,
+                "reason": "status_lookup_timeout",
+            }
+
+        pending_requests = response.get("data", []) if isinstance(response, dict) else []
+        if not isinstance(pending_requests, list):
+            pending_requests = []
+
+        for pending_request in pending_requests:
+            if not isinstance(pending_request, dict):
+                continue
+            if pending_request.get("id") != request_id:
+                continue
+
+            raw_upstream_status = pending_request.get("status")
+            upstream_status = (
+                raw_upstream_status
+                if isinstance(raw_upstream_status, str)
+                and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", raw_upstream_status)
+                else None
+            )
+            normalized = str(upstream_status or "").lower()
+            if normalized == "in_progress":
+                status = "in_progress"
+            elif normalized == "successful":
+                status = "confirmed"
+            elif normalized == "failed":
+                status = "failed"
+            else:
+                status = "unknown"
+
+            safe_upstream = {
+                key: pending_request[key]
+                for key in ("id",)
+                if key in pending_request
+            }
+            if upstream_status is not None:
+                safe_upstream["status"] = upstream_status
+            return {
+                "status": status,
+                "request_id": request_id,
+                "upstream_status": upstream_status,
+                "upstream": safe_upstream,
+            }
+
+        return {
+            "status": "unknown",
+            "request_id": request_id,
+            "upstream_status": None,
+            "reason": "request_not_found",
+        }
+
+    def _get_engine_action_headers(self) -> dict[str, str]:
+        return {
+            "Accept": "application/json",
+            "Accept-charset": "utf-8",
+            "Authorization": "Bearer " + self._bearer_token["access_token"],
+            "User-Agent": AudiAPI.HDR_USER_AGENT,
+            "Content-Type": "application/json; charset=utf-8",
+            "Accept-encoding": "gzip",
+        }
+
+    @staticmethod
+    def _engine_request_id(response: object, action: str) -> str:
+        request_id = None
+        if isinstance(response, dict):
+            data = response.get("data")
+            if isinstance(data, dict):
+                request_id = data.get("requestID")
+        if not isinstance(request_id, str) or not request_id:
+            raise AmbiguousActionError(
+                f"Audi accepted the {action} response without a request ID"
+            )
+        return request_id
 
     # --- Security helpers ---
 

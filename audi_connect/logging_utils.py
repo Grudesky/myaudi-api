@@ -14,7 +14,8 @@ from typing import Any
 
 _JSON_KEY_PATTERN = re.compile(
     r'("(?:access_token|refresh_token|id_token|securityToken|'
-    r'securityPinHash|hmac|password|spin|client_secret|code_verifier)"\s*:\s*")'
+    r'securityPinHash|userPromptProof|securedActivationData|hmac|password|spin|'
+    r'client_secret|code_verifier)"\s*:\s*")'
     r'[^"]+(")',
     re.IGNORECASE,
 )

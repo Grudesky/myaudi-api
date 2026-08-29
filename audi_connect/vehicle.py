@@ -2,13 +2,24 @@
 
 import asyncio
 import logging
+import uuid
 from typing import Optional
 
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from aiohttp import ClientResponseError
 
 from .auth import AudiAuth
-from .exceptions import ActionFailedError, RequestTimeoutError
+from .exceptions import (
+    ActionFailedError,
+    ActionInProgressError,
+    AmbiguousActionError,
+    ActionNotFoundError,
+    ActionPersistenceError,
+    CapabilityNotSupportedError,
+    InvalidActionRequestError,
+    RequestTimeoutError,
+)
+from .engine_actions import EngineActionStore, validate_request_id
 from .models import VehicleDataResponse, TripDataResponse, LockState, DoorState, WindowState
 from .utils import parse_int, parse_float
 
@@ -35,7 +46,12 @@ MAX_HEATER_DURATION_MIN = 60
 
 
 class AudiVehicle:
-    def __init__(self, auth: AudiAuth, vehicle_info: dict):
+    def __init__(
+        self,
+        auth: AudiAuth,
+        vehicle_info: dict,
+        engine_action_store: Optional[EngineActionStore] = None,
+    ):
         self._auth = auth
         self.vin: str = vehicle_info.get("vin", "")
         self.csid: str = vehicle_info.get("csid", "")
@@ -63,6 +79,19 @@ class AudiVehicle:
         self._position_fetched: bool = False
         self._trip_shortterm: Optional[TripDataResponse] = None
         self._trip_longterm: Optional[TripDataResponse] = None
+        self._engine_action_lock = asyncio.Lock()
+        self._engine_action_store = engine_action_store
+        self._engine_actions: dict[str, dict] = {}
+        self._active_engine_action: Optional[dict] = None
+        self._engine_action_state_error = False
+        if self._engine_action_store is not None:
+            try:
+                self._active_engine_action = self._engine_action_store.active_for(self.vin)
+                self._reload_engine_actions()
+            except ActionPersistenceError:
+                # Status monitoring can continue, but every engine command and
+                # recovery operation will fail closed through the unusable store.
+                self._engine_action_state_error = True
 
     async def update(self) -> None:
         """Fetch all vehicle data from the API in parallel."""
@@ -130,6 +159,21 @@ class AudiVehicle:
     def capability_ids(self) -> tuple[str, ...]:
         """Literal capability IDs advertised by CARIAD, without support inference."""
         return self._vehicle_data.capability_ids if self._vehicle_data else ()
+
+    @property
+    def engine_actions(self) -> dict[str, dict]:
+        """Return retained engine-action states keyed by CARIAD request ID."""
+        return {
+            request_id: dict(action)
+            for request_id, action in self._engine_actions.items()
+        }
+
+    @property
+    def active_engine_action(self) -> Optional[dict]:
+        """Return the durable unresolved command record, without any secrets."""
+        if self._engine_action_state_error:
+            return {"status": "persistence_error"}
+        return dict(self._active_engine_action) if self._active_engine_action else None
 
     # --- Vehicle info ---
 
@@ -616,6 +660,186 @@ class AudiVehicle:
     @_idempotent_action_retry
     async def stop_preheater(self) -> None:
         await self._auth.stop_preheater(self.vin)
+
+    async def start_engine(self) -> str:
+        return await self._submit_engine_action("engine_start")
+
+    async def stop_engine(self) -> str:
+        return await self._submit_engine_action("engine_stop")
+
+    async def _submit_engine_action(self, action: str) -> str:
+        self._require_engine_control()
+        store = self._require_engine_action_store()
+        async with self._engine_action_lock:
+            self._active_engine_action = store.active_for(self.vin)
+            if self._active_engine_action is not None:
+                raise ActionInProgressError(
+                    "Another engine action is still unresolved for this vehicle"
+                )
+
+            self._active_engine_action = store.begin(self.vin, action)
+            local_action_id = self._active_engine_action["local_action_id"]
+            submission_began = False
+
+            def mark_submission_began() -> None:
+                nonlocal submission_began
+                self._active_engine_action = store.transition(
+                    self.vin,
+                    local_action_id,
+                    "ambiguous",
+                )
+                submission_began = True
+
+            try:
+                if action == "engine_start":
+                    request_id = await self._auth.start_engine(
+                        self.vin,
+                        mark_submission_began,
+                    )
+                else:
+                    request_id = await self._auth.stop_engine(
+                        self.vin,
+                        mark_submission_began,
+                    )
+            except AmbiguousActionError:
+                if not submission_began:
+                    self._active_engine_action = store.transition(
+                        self.vin,
+                        local_action_id,
+                        "ambiguous",
+                    )
+                raise
+            except asyncio.CancelledError:
+                if not submission_began:
+                    store.abort_before_submission(self.vin, local_action_id)
+                    self._active_engine_action = None
+                # After the callback, the durable ambiguous marker remains.
+                raise
+            except Exception as exc:
+                if submission_began:
+                    raise AmbiguousActionError(
+                        "Engine command submission outcome is unknown"
+                    ) from exc
+                store.abort_before_submission(self.vin, local_action_id)
+                self._active_engine_action = None
+                raise
+
+            try:
+                validate_request_id(request_id)
+            except InvalidActionRequestError as exc:
+                raise AmbiguousActionError(
+                    "Audi accepted the engine command without a valid request ID"
+                ) from exc
+            try:
+                record = store.transition(
+                    self.vin,
+                    local_action_id,
+                    "sent",
+                    request_id=request_id,
+                )
+            except ActionPersistenceError as exc:
+                # The command may be accepted and the durable record remains at
+                # the pre-POST ambiguous boundary. Never make this retryable.
+                raise AmbiguousActionError(
+                    "Engine command was accepted but its request ID could not be persisted"
+                ) from exc
+            self._engine_actions[request_id] = record
+            self._active_engine_action = record
+            return request_id
+
+    async def get_engine_action_status(self, request_id: str) -> dict:
+        validate_request_id(request_id)
+        store = self._require_engine_action_store()
+        known = self._engine_actions.get(request_id)
+        if known is None:
+            raise ActionNotFoundError(
+                "Engine action was not found for this vehicle"
+            )
+        if known.get("status") in {"confirmed", "failed", "operator_recovered"}:
+            return {
+                "status": known["status"],
+                "request_id": request_id,
+                "upstream_status": None,
+            }
+
+        result = await self._auth.get_engine_action_status(self.vin, request_id)
+        async with self._engine_action_lock:
+            self._active_engine_action = store.active_for(self.vin)
+            if (
+                self._active_engine_action is None
+                or self._active_engine_action.get("request_id") != request_id
+            ):
+                raise ActionNotFoundError(
+                    "Engine action is no longer unresolved for this vehicle"
+                )
+            local_action_id = self._active_engine_action["local_action_id"]
+            normalized = result.get("status")
+            if normalized in {"confirmed", "failed"}:
+                record = store.resolve_terminal(
+                    self.vin,
+                    local_action_id,
+                    normalized,
+                )
+                self._active_engine_action = None
+                self._reload_engine_actions()
+            else:
+                unresolved_status = (
+                    "in_progress" if normalized == "in_progress" else "ambiguous"
+                )
+                record = store.transition(
+                    self.vin,
+                    local_action_id,
+                    unresolved_status,
+                    request_id=request_id,
+                )
+                self._active_engine_action = record
+            self._engine_actions[request_id] = record
+        return result
+
+    async def recover_engine_action(self, local_action_id: str) -> dict:
+        """Explicitly release one durable unresolved guard without a vehicle call."""
+        try:
+            uuid.UUID(local_action_id)
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise InvalidActionRequestError("Invalid local engine action ID") from exc
+        store = self._require_engine_action_store()
+        async with self._engine_action_lock:
+            self._active_engine_action = store.active_for(self.vin)
+            if self._active_engine_action is None:
+                raise ActionNotFoundError(
+                    "No unresolved engine action exists for this vehicle"
+                )
+            recovered = store.recover(self.vin, local_action_id)
+            request_id = recovered.get("request_id")
+            if request_id:
+                self._engine_actions[request_id] = recovered
+            self._active_engine_action = None
+            self._reload_engine_actions()
+            return recovered
+
+    def _require_engine_control(self) -> None:
+        if "engineControl" not in self.capability_ids:
+            raise CapabilityNotSupportedError(
+                "Vehicle does not advertise the engineControl capability"
+            )
+
+    def _require_engine_action_store(self) -> EngineActionStore:
+        if self._engine_action_store is None:
+            raise ActionPersistenceError(
+                "Durable engine-action storage is required for engine commands"
+            )
+        return self._engine_action_store
+
+    def _reload_engine_actions(self) -> None:
+        store = self._require_engine_action_store()
+        retained = store.history_for(self.vin)
+        if self._active_engine_action is not None:
+            retained.append(self._active_engine_action)
+        self._engine_actions = {
+            record["request_id"]: record
+            for record in retained
+            if record.get("request_id")
+        }
 
     def get_brief(self) -> dict[str, str]:
         """Return only the 3 most important fields: locked status, position, range."""

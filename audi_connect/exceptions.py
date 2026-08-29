@@ -21,6 +21,30 @@ class ActionFailedError(AudiConnectError):
     """Raised when a vehicle action (lock, climate, etc.) fails."""
 
 
+class AmbiguousActionError(ActionFailedError):
+    """Raised when Audi may have accepted an action but no result was received."""
+
+
+class ActionInProgressError(ActionFailedError):
+    """Raised when another mutually exclusive vehicle action is unresolved."""
+
+
+class CapabilityNotSupportedError(ActionFailedError):
+    """Raised when a vehicle does not advertise a required capability."""
+
+
+class ActionPersistenceError(ActionFailedError):
+    """Raised when durable action state cannot be safely read or written."""
+
+
+class ActionNotFoundError(ActionFailedError):
+    """Raised when an action ID is not associated with the requested vehicle."""
+
+
+class InvalidActionRequestError(ActionFailedError):
+    """Raised when an action or request identifier is invalid."""
+
+
 class SpinRequiredError(AudiConnectError):
     """Raised when an action requires S-PIN but none was provided."""
 

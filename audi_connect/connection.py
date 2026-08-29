@@ -8,6 +8,7 @@ import certifi
 
 from .api import AudiAPI
 from .auth import AudiAuth
+from .engine_actions import EngineActionStore, default_engine_action_state_file
 from .vehicle import AudiVehicle
 
 
@@ -41,5 +42,9 @@ async def connect_and_get_vehicles(
 
     print(f"{len(vehicle_list)} vehicle(s) found\n")
 
-    vehicles = [AudiVehicle(auth, v_info) for v_info in vehicle_list]
+    action_store = EngineActionStore(default_engine_action_state_file())
+    vehicles = [
+        AudiVehicle(auth, v_info, engine_action_store=action_store)
+        for v_info in vehicle_list
+    ]
     return auth, vehicles

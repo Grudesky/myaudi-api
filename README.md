@@ -83,13 +83,14 @@ AUDI_WEBHOOK_URL=https://n8n.example.com/webhook/audi
 | `AUDI_USERNAME` | myAudi account email | (required) |
 | `AUDI_PASSWORD` | Password | (required) |
 | `AUDI_COUNTRY` | Country code (DE, FR, US, etc.) | `DE` |
-| `AUDI_SPIN` | S-PIN for lock/unlock | (optional) |
+| `AUDI_SPIN` | S-PIN for lock/unlock and remote engine start | (optional) |
 | `AUDI_API_LEVEL` | `0` = legacy MBB, `1` = new CARIAD API | `1` |
 | `AUDI_DEFAULT_VIN` | Default VIN — skip `--vin` for single-vehicle users | (optional) |
 | `AUDI_WEBHOOK_URL` | Webhook URL for state change notifications | (optional) |
 | `AUDI_WEBHOOK_SECRET` | If set, webhooks are signed with HMAC-SHA256 in the `X-Audi-Signature` header | (optional) |
 | `AUDI_WATCH_INTERVAL` | Background poll interval in seconds (API server only) | `0` (disabled) |
 | `AUDI_LIVE_POLL_MIN_INTERVAL` | Minimum interval between normal live `/status` polls | `900` (15 min) |
+| `AUDI_ENGINE_ACTION_STATE_FILE` | Path on a durable volume for secret-free unresolved engine-action state; engine REST commands fail closed when unset | (required for engine REST commands) |
 | `AUDI_CACHE_TTL` | Data cache TTL in seconds | `14400` (4h) |
 | `AUDI_API_KEY` | Required header `X-API-Key` on all endpoints except `/health`, `/ready`, `/metrics`. Set to a strong random token. | (optional but **strongly recommended**) |
 
@@ -228,10 +229,19 @@ Every request gets an `X-Request-ID` header (provided by the client if present, 
 | `POST` | `/{vin}/climate/stop` | X-API-Key | Stop climate |
 | `POST` | `/{vin}/heater/start` | X-API-Key | Start heater (`?duration=30&confirm=true`) |
 | `POST` | `/{vin}/heater/stop` | X-API-Key | Stop heater |
+| `POST` | `/{vin}/engine/start` | X-API-Key | Start a supported gasoline engine; returns CARIAD request ID |
+| `POST` | `/{vin}/engine/stop` | X-API-Key | Stop a supported gasoline engine; returns CARIAD request ID |
+| `GET` | `/{vin}/actions/{request_id}` | X-API-Key | Query a CARIAD engine-action result |
+| `GET` | `/{vin}/engine/action` | X-API-Key | Inspect the durable unresolved engine-action guard |
+| `POST` | `/{vin}/engine/actions/{local_action_id}/recover?confirm=true` | X-API-Key | Explicitly release an unresolved guard without a vehicle command |
 
 Action endpoints accept `?confirm=true` to wait 5 seconds after the action, re-fetch vehicle data, and return the updated status. Without it, the response is immediate (`"status": "sent"`).
 
 Cache is automatically invalidated after any action so the next `GET /status` reflects the change.
+
+Engine actions are the exception: they are confirmed through CARIAD
+`pendingrequests` and never invalidate or force-refresh vehicle status, so they
+do not alter the live-poll cooldown.
 
 **Rate limiting**: read endpoints allow 30 requests/min, action endpoints allow 5 requests/min. Exceeding returns HTTP 429. The `/health`, `/ready` and `/metrics` endpoints are not rate-limited and don't require `X-API-Key` — they are intended for kubelet probes and Prometheus scraping.
 
@@ -365,7 +375,8 @@ myaudi-api/
     auth.py                # Token coordinator (delegates to oauth.py / client / actions)
     endpoints.py           # cariad_url() helper + AudiEndpoints (URL building + home-region cache)
     client.py              # Read-only API calls (status, position, trips)
-    actions.py             # Remote actions (lock, climate, heater)
+    actions.py             # Remote actions (lock, climate, heater, engine)
+    engine_actions.py      # Durable fail-closed engine-action state and recovery
     api.py                 # Low-level HTTP client (retry, timeout)
     connection.py          # Shared connection helpers
     vehicle.py             # AudiVehicle (properties, validation, brief/dashboard, idempotent-only retry)

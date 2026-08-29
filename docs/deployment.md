@@ -33,6 +33,12 @@ Image registry: `ghcr.io/john6810/myaudi-api`. Tags: `<short-sha>` plus `latest`
 - Replicas: **1** by design (cf [architecture.md](architecture.md) — single-replica invariant). Strategy: `Recreate` (no rolling — there's only one pod and the in-process state can't be split).
 - Resource requests typical for the API tier: `~50m CPU / 128Mi memory request`, `200m / 256Mi limit`. Adjust if metrics show pressure.
 
+Remote engine start/stop additionally requires a persistent volume mounted into
+the pod and `AUDI_ENGINE_ACTION_STATE_FILE` set to a file on that volume. The
+server intentionally has no container-filesystem default: without this setting,
+engine endpoints fail closed with 503. A pod recreation must preserve this file
+or the at-most-once crash guard cannot be guaranteed.
+
 ## Secrets
 
 Sealed-secrets, NOT raw `kubectl create secret`. The plaintext never lands in any repo.

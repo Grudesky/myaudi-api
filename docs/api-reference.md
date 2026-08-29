@@ -179,6 +179,75 @@ curl -H "X-API-Key: $AUDI_API_KEY" "http://localhost:8000/last-parked?vin=WAUXXX
 - Auth: `X-API-Key`. Rate limit: 5/min. `?confirm=true` supported.
 - Idempotent: retried up to 3× on transient errors.
 
+### `POST /{vin}/engine/start`
+
+- Auth: `X-API-Key`; `AUDI_SPIN` must be configured.
+- Rate limit: 5/min. The vehicle must literally advertise `engineControl`.
+- Obtains a CARIAD `userPromptProof`, submits it with the S-PIN, and returns
+  `{"status": "sent", "action": "engine_start", "vin", "request_id"}`.
+- The start submission is non-idempotent and is attempted exactly once. An
+  ambiguous result is returned as structured `unknown` and durably blocks a
+  duplicate engine command for that VIN, including after process restart.
+- Proof acquisition is one application-level attempt. The command POST and
+  proof PUT do not follow redirects.
+
+### `POST /{vin}/engine/stop`
+
+- Auth: `X-API-Key`. Rate limit: 5/min. The vehicle must advertise
+  `engineControl`.
+- Returns the same shape with `action: "engine_stop"` and the CARIAD request ID.
+- Stop is also attempted exactly once because its transport retry safety has
+  not been independently established. It uses the same durable unresolved
+  guard as start.
+
+### `GET /{vin}/actions/{request_id}`
+
+- Auth: `X-API-Key`. Rate limit: 30/min.
+- Queries CARIAD `pendingrequests` and maps upstream states to `in_progress`,
+  `confirmed`, `failed`, or `unknown`, while retaining `upstream_status`.
+- Only request IDs already associated with the specified vehicle are accepted.
+- Engine submissions and status checks never call `/status`, invalidate cached
+  vehicle data, or modify the persisted live-poll cooldown.
+
+### `GET /{vin}/engine/action`
+
+- Returns the secret-free durable unresolved action record, including its local
+  action ID. It never contacts Audi.
+
+### `POST /{vin}/engine/actions/{local_action_id}/recover?confirm=true`
+
+- Explicit operator recovery for an action that cannot be resolved through
+  CARIAD `pendingrequests`. It clears only the matching durable guard and never
+  sends a vehicle command.
+- Recovery is never automatic or time-based. Omitting `confirm=true` is rejected.
+
+### Engine-action state machine
+
+The API server requires `AUDI_ENGINE_ACTION_STATE_FILE` to point to a durable
+volume; engine commands fail closed with 503 when it is unset or unreadable.
+The fixed-schema file contains only VIN, action, normalized state,
+timestamps, a local action ID, and the CARIAD request ID when known. It never
+contains authentication headers, tokens, S-PIN, `userPromptProof`, or
+`securedActivationData`.
+
+Transitions are:
+
+1. `submitting` is persisted before proof acquisition.
+2. A proof failure or cancellation before the command boundary removes only
+   that pre-command marker.
+3. `ambiguous` is persisted synchronously immediately before the engine POST.
+4. A valid CARIAD request ID advances it to `sent`; status lookup can advance it
+   to `in_progress`.
+5. Only a matching literal CARIAD `successful` or `failed` result automatically
+   resolves it as `confirmed` or `failed`. Other status strings remain unresolved.
+6. Malformed/empty responses, HTTP errors, transport loss, cancellation,
+   unknown status, timeout, and `request_not_found` remain unresolved.
+7. `operator_recovered` is possible only through the explicit recovery endpoint.
+
+No HTTP status after the engine POST begins is treated as definite pre-enqueue
+rejection: the reverse-engineered CARIAD reference does not document such a
+guarantee. Corrupt or unreadable state disables engine commands fail-closed.
+
 ## CLI commands
 
 Entry point: `python main.py <command> [flags]`. Global flags valid both before and after the subcommand: `-u/--username`, `-p/--password`, `-c/--country`, `--spin`, `--api-level`, `--vin`, `-v/--verbose`. Default values are read from environment variables (`AUDI_USERNAME`, `AUDI_PASSWORD`, etc.) — the `.env` file is loaded automatically via `python-dotenv`.
