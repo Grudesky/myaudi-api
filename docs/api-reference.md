@@ -47,8 +47,15 @@ curl -H "X-API-Key: $AUDI_API_KEY" http://localhost:8000/vehicles
 
 - Auth: `X-API-Key`.
 - Rate limit: 30/min.
-- Query: `?vin=<VIN>` (optional, filters to one vehicle).
-- Returns: `{"count": int, "vehicles": [{"vin", "model", "title", **dashboard}]}` — the dashboard dict is `AudiVehicle.get_dashboard()`.
+- Query: `?vin=<VIN>` (optional, filters to one vehicle) and `?force=true`
+  (optional, bypasses the application live-poll cooldown; Audi upstream rate
+  limits still apply).
+- Returns HTTP 200 with `{"status": "live", "live_poll_at": str, "count": int, "vehicles": [{"vin", "model", "title", **dashboard}]}` after a live Audi request.
+- Returns HTTP 429 with `reason: "live_poll_cooldown"`, `Retry-After`,
+  `last_live_poll`, `next_live_poll`, and `retry_after_seconds` when a normal
+  request arrives before the live-poll cooldown expires. The default cooldown
+  is 900 seconds (15 minutes), configurable with
+  `AUDI_LIVE_POLL_MIN_INTERVAL`.
 - `access` is the structured vehicle access state. Diagnostic Boolean values are `null` when Audi reports an unknown, unsupported, missing, or contradictory value:
 
 ```json

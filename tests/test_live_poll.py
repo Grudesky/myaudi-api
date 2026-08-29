@@ -13,6 +13,7 @@ async def test_live_update_performs_fetch_and_sets_timestamp(monkeypatch):
     vehicle._fetch_vehicle_data = AsyncMock(return_value=None)
     vehicle._fetch_position = AsyncMock(return_value=None)
     client.vehicles = [vehicle]
+    monkeypatch.setattr(client, "_save_live_poll_state", MagicMock())
 
     updated, retry_after = await client.live_update_vehicles()
 
@@ -35,6 +36,24 @@ async def test_live_update_blocks_during_cooldown(monkeypatch):
     assert updated is False
     assert 0 < retry_after <= api_module.LIVE_POLL_MIN_INTERVAL
     vehicle._fetch_vehicle_data.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_forced_live_update_bypasses_cooldown(monkeypatch):
+    client = api_module.AudiClient()
+    vehicle = MagicMock()
+    vehicle._fetch_vehicle_data = AsyncMock(return_value=None)
+    vehicle._fetch_position = AsyncMock(return_value=None)
+    client.vehicles = [vehicle]
+    client._last_live_poll = time.time()
+    monkeypatch.setattr(client, "_save_live_poll_state", MagicMock())
+
+    updated, retry_after = await client.live_update_vehicles(force=True)
+
+    assert updated is True
+    assert retry_after == 0.0
+    vehicle._fetch_vehicle_data.assert_awaited_once_with(raise_on_error=True)
+    vehicle._fetch_position.assert_awaited_once_with()
 
 
 @pytest.mark.asyncio

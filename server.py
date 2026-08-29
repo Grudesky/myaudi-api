@@ -98,7 +98,7 @@ TOKEN_REFRESH_INTERVAL = 45 * 60
 
 # Cache vehicle data to avoid hammering Audi's API (default: 4 hours)
 DATA_CACHE_TTL = int(os.getenv("AUDI_CACHE_TTL", "14400"))
-LIVE_POLL_MIN_INTERVAL = int(os.getenv("AUDI_LIVE_POLL_MIN_INTERVAL", "600"))
+LIVE_POLL_MIN_INTERVAL = int(os.getenv("AUDI_LIVE_POLL_MIN_INTERVAL", "900"))
 LIVE_POLL_STATE_FILE = Path(
     os.getenv(
         "AUDI_LIVE_POLL_STATE_FILE",
@@ -354,14 +354,17 @@ class AudiClient:
             audi_backend_request_duration_seconds.labels(endpoint="update").observe(time.time() - t0)
             log.info("Vehicle data cached for %ds", DATA_CACHE_TTL)
 
-    async def live_update_vehicles(self) -> tuple[bool, float]:
+    async def live_update_vehicles(self, force: bool = False) -> tuple[bool, float]:
         """Perform a real Audi update if the live-poll cooldown has elapsed.
+
+        When force is true, bypass the application cooldown and attempt the
+        Audi request immediately. Audi's own upstream rate limits still apply.
 
         Returns (updated, retry_after_seconds).
         """
         async with self._update_lock:
             now = time.time()
-            if self._last_live_poll:
+            if not force and self._last_live_poll:
                 elapsed = now - self._last_live_poll
                 if elapsed < LIVE_POLL_MIN_INTERVAL:
                     return False, LIVE_POLL_MIN_INTERVAL - elapsed
@@ -678,10 +681,14 @@ async def list_vehicles(request: Request):
 # --- Status ---
 @app.get("/status", dependencies=[Depends(require_api_key)])
 @limiter.limit("30/minute")
-async def get_status(request: Request, vin: Optional[str] = Query(None, description="Filter by VIN")):
+async def get_status(
+    request: Request,
+    vin: Optional[str] = Query(None, description="Filter by VIN"),
+    force: bool = Query(False, description="Bypass the live-poll cooldown"),
+):
     await _require_auth()
 
-    updated, retry_after = await client.live_update_vehicles()
+    updated, retry_after = await client.live_update_vehicles(force=force)
 
     if not updated:
         retry_after_seconds = max(1, int(retry_after + 0.999))

@@ -19,10 +19,11 @@ def status_client(monkeypatch):
 def test_status_returns_live_after_real_update(status_client, monkeypatch):
     now = time.time()
     monkeypatch.setattr(api_module.client, "_last_live_poll", now)
+    live_update = AsyncMock(return_value=(True, 0.0))
     monkeypatch.setattr(
         api_module.client,
         "live_update_vehicles",
-        AsyncMock(return_value=(True, 0.0)),
+        live_update,
     )
 
     response = status_client.get(
@@ -36,15 +37,17 @@ def test_status_returns_live_after_real_update(status_client, monkeypatch):
     assert body["count"] == 0
     assert body["vehicles"] == []
     assert "live_poll_at" in body
+    live_update.assert_awaited_once_with(force=False)
 
 
 def test_status_returns_429_during_live_poll_cooldown(status_client, monkeypatch):
     now = time.time()
     monkeypatch.setattr(api_module.client, "_last_live_poll", now)
+    live_update = AsyncMock(return_value=(False, 123.4))
     monkeypatch.setattr(
         api_module.client,
         "live_update_vehicles",
-        AsyncMock(return_value=(False, 123.4)),
+        live_update,
     )
 
     response = status_client.get(
@@ -62,3 +65,20 @@ def test_status_returns_429_during_live_poll_cooldown(status_client, monkeypatch
     assert "last_live_poll" in body
     assert "next_live_poll" in body
     assert "vehicles" not in body
+    live_update.assert_awaited_once_with(force=False)
+
+
+def test_status_force_bypasses_live_poll_cooldown(status_client, monkeypatch):
+    now = time.time()
+    monkeypatch.setattr(api_module.client, "_last_live_poll", now)
+    live_update = AsyncMock(return_value=(True, 0.0))
+    monkeypatch.setattr(api_module.client, "live_update_vehicles", live_update)
+
+    response = status_client.get(
+        "/status?force=true",
+        headers={"X-API-Key": "test-key"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "live"
+    live_update.assert_awaited_once_with(force=True)

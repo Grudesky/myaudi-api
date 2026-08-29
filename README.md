@@ -89,6 +89,7 @@ AUDI_WEBHOOK_URL=https://n8n.example.com/webhook/audi
 | `AUDI_WEBHOOK_URL` | Webhook URL for state change notifications | (optional) |
 | `AUDI_WEBHOOK_SECRET` | If set, webhooks are signed with HMAC-SHA256 in the `X-Audi-Signature` header | (optional) |
 | `AUDI_WATCH_INTERVAL` | Background poll interval in seconds (API server only) | `0` (disabled) |
+| `AUDI_LIVE_POLL_MIN_INTERVAL` | Minimum interval between normal live `/status` polls | `900` (15 min) |
 | `AUDI_CACHE_TTL` | Data cache TTL in seconds | `14400` (4h) |
 | `AUDI_API_KEY` | Required header `X-API-Key` on all endpoints except `/health`, `/ready`, `/metrics`. Set to a strong random token. | (optional but **strongly recommended**) |
 
