@@ -6,9 +6,10 @@ import logging
 import re
 from collections.abc import Callable
 from hashlib import sha512
+from http import HTTPStatus
 from typing import Optional
 
-from aiohttp import ClientResponseError
+from aiohttp import ClientConnectionError, ClientResponseError
 
 from .api import AudiAPI
 from .endpoints import AudiEndpoints
@@ -212,6 +213,12 @@ class AudiVehicleActions:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            self._log_engine_action_failure(
+                "engine_start",
+                "userpromptproof",
+                "/vehicle/v1/engine/{vin}/userpromptproof",
+                exc,
+            )
             raise ActionFailedError(
                 "Could not obtain remote engine-start authorization proof"
             ) from exc
@@ -252,6 +259,12 @@ class AudiVehicleActions:
         except Exception as exc:
             # CARIAD does not document any post-submission HTTP response as proof
             # that the command was rejected before enqueueing. Fail closed.
+            self._log_engine_action_failure(
+                "engine_start",
+                "submission",
+                "/vehicle/v1/engine/{vin}/start",
+                exc,
+            )
             raise AmbiguousActionError(
                 "Remote engine-start submission outcome is unknown"
             ) from exc
@@ -284,6 +297,12 @@ class AudiVehicleActions:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            self._log_engine_action_failure(
+                "engine_stop",
+                "submission",
+                "/vehicle/v1/engine/{vin}/stop",
+                exc,
+            )
             raise AmbiguousActionError(
                 "Remote engine-stop submission outcome is unknown"
             ) from exc
@@ -362,6 +381,81 @@ class AudiVehicleActions:
             "Content-Type": "application/json; charset=utf-8",
             "Accept-encoding": "gzip",
         }
+
+    @staticmethod
+    def _log_engine_action_failure(
+        action: str,
+        phase: str,
+        endpoint: str,
+        exc: Exception,
+    ) -> None:
+        common = (
+            "Remote engine action failed action=%s phase=%s endpoint=%s "
+            "exception=%s"
+        )
+        exception_type = type(exc).__name__
+
+        if isinstance(exc, ClientResponseError):
+            try:
+                standard_reason = HTTPStatus(exc.status).phrase
+            except ValueError:
+                standard_reason = None
+            reason = (
+                exc.message
+                if isinstance(exc.message, str)
+                and standard_reason is not None
+                and exc.message == standard_reason
+                else "unavailable"
+            )
+            body = getattr(exc, "safe_response_body", "unavailable")
+            if not isinstance(body, str) or not re.fullmatch(
+                r"[A-Za-z0-9 _,=]{1,300}",
+                body,
+            ):
+                body = "unavailable"
+            _LOGGER.error(
+                common
+                + " category=http_response status=%s reason=%s response_body=%s",
+                action,
+                phase,
+                endpoint,
+                exception_type,
+                exc.status,
+                reason,
+                body,
+            )
+            return
+
+        if isinstance(exc, json.JSONDecodeError):
+            _LOGGER.error(
+                common + " category=response_parse detail=invalid_json",
+                action,
+                phase,
+                endpoint,
+                exception_type,
+            )
+            return
+
+        if isinstance(exc, (RequestTimeoutError, TimeoutError)):
+            category = "timeout"
+        elif isinstance(
+            exc,
+            (ClientConnectionError, ConnectionError, OSError),
+        ):
+            category = "transport"
+        elif isinstance(exc, AmbiguousActionError):
+            category = "response_validation"
+        else:
+            category = "unexpected"
+
+        _LOGGER.error(
+            common + " category=%s",
+            action,
+            phase,
+            endpoint,
+            exception_type,
+            category,
+        )
 
     @staticmethod
     def _engine_request_id(response: object, action: str) -> str:

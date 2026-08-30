@@ -196,6 +196,197 @@ class TestEngineStartTransport:
         boundary.assert_called_once_with()
 
 
+class TestEngineActionDiagnostics:
+    @pytest.mark.asyncio
+    async def test_http_error_logs_safe_status_reason_and_body_shape(self, caplog):
+        session = aiohttp.ClientSession()
+        try:
+            api = AudiAPI(session)
+            actions = AudiVehicleActions(
+                api,
+                AudiEndpoints(api, country="US", api_level=1),
+                {"access_token": "bearer-secret"},
+                {"access_token": "vw-secret"},
+                "xclient",
+                "US",
+                "2468",
+                1,
+            )
+            proof_url = (
+                "https://na.bff.cariad.digital/vehicle/v1/engine/"
+                "WAUTEST/userpromptproof"
+            )
+            start_url = (
+                "https://na.bff.cariad.digital/vehicle/v1/engine/"
+                "WAUTEST/start"
+            )
+            with aioresponses() as mocked:
+                mocked.put(
+                    proof_url,
+                    payload={"userPromptProof": "proof-secret"},
+                )
+                mocked.post(
+                    start_url,
+                    status=403,
+                    reason="Forbidden",
+                    payload={
+                        "error": {
+                            "code": "denied",
+                            "message": (
+                                "spin=2468 proof=proof-secret "
+                                "activation=activation-secret"
+                            ),
+                        },
+                        "Authorization": "Bearer bearer-secret",
+                    },
+                )
+                with caplog.at_level("ERROR", logger="audi_connect.actions"):
+                    with pytest.raises(AmbiguousActionError) as raised:
+                        await actions.start_engine("WAUTEST")
+
+            assert isinstance(raised.value.__cause__, aiohttp.ClientResponseError)
+            log_text = caplog.text
+            assert "action=engine_start" in log_text
+            assert "phase=submission" in log_text
+            assert "endpoint=/vehicle/v1/engine/{vin}/start" in log_text
+            assert "exception=ClientResponseError" in log_text
+            assert "category=http_response" in log_text
+            assert "status=403" in log_text
+            assert "reason=Forbidden" in log_text
+            assert "response_body=json_object" in log_text
+            assert "error_fields=code,message" in log_text
+            for secret in (
+                "2468",
+                "proof-secret",
+                "activation-secret",
+                "bearer-secret",
+            ):
+                assert secret not in log_text
+        finally:
+            await session.close()
+
+    @pytest.mark.asyncio
+    async def test_malformed_json_logs_parse_failure_without_body(self, caplog):
+        actions = make_actions(spin="2468")
+        secret_body = (
+            '{"spin":"2468","userPromptProof":"proof-secret",'
+            '"securedActivationData":"activation-secret",'
+            '"Authorization":"Bearer bearer-secret"'
+        )
+        parse_error = json.JSONDecodeError("malformed", secret_body, 0)
+        actions._api.request_once.side_effect = [
+            {"userPromptProof": "proof-secret"},
+            parse_error,
+        ]
+
+        with caplog.at_level("ERROR", logger="audi_connect.actions"):
+            with pytest.raises(AmbiguousActionError) as raised:
+                await actions.start_engine("WAUTEST")
+
+        assert raised.value.__cause__ is parse_error
+        assert "action=engine_start" in caplog.text
+        assert "phase=submission" in caplog.text
+        assert "exception=JSONDecodeError" in caplog.text
+        assert "category=response_parse" in caplog.text
+        assert "detail=invalid_json" in caplog.text
+        assert secret_body not in caplog.text
+        for secret in ("2468", "proof-secret", "activation-secret", "bearer-secret"):
+            assert secret not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_nonstandard_http_reason_is_not_logged(self, caplog):
+        actions = make_actions(spin="2468")
+        error = aiohttp.ClientResponseError(
+            MagicMock(),
+            (),
+            status=403,
+            message=(
+                "Forbidden spin=2468 proof-secret "
+                "activation-secret bearer-secret"
+            ),
+        )
+        actions._api.request_once.side_effect = [
+            {"userPromptProof": "proof-secret"},
+            error,
+        ]
+
+        with caplog.at_level("ERROR", logger="audi_connect.actions"):
+            with pytest.raises(AmbiguousActionError):
+                await actions.start_engine("WAUTEST")
+
+        assert "status=403" in caplog.text
+        assert "reason=unavailable" in caplog.text
+        for secret in ("2468", "proof-secret", "activation-secret", "bearer-secret"):
+            assert secret not in caplog.text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("action", "error", "category"),
+        [
+            (
+                "engine_start",
+                RequestTimeoutError("timed out with spin 2468"),
+                "timeout",
+            ),
+            (
+                "engine_start",
+                aiohttp.ClientConnectionError("lost bearer-secret"),
+                "transport",
+            ),
+            (
+                "engine_stop",
+                ConnectionError("lost proof-secret activation-secret"),
+                "transport",
+            ),
+        ],
+    )
+    async def test_transport_categories_do_not_log_exception_messages(
+        self,
+        caplog,
+        action,
+        error,
+        category,
+    ):
+        actions = make_actions(spin="2468")
+        if action == "engine_start":
+            actions._api.request_once.side_effect = [
+                {"userPromptProof": "proof-secret"},
+                error,
+            ]
+            operation = actions.start_engine("WAUTEST")
+        else:
+            actions._api.request_once.side_effect = error
+            operation = actions.stop_engine("WAUTEST")
+
+        with caplog.at_level("ERROR", logger="audi_connect.actions"):
+            with pytest.raises(AmbiguousActionError) as raised:
+                await operation
+
+        assert raised.value.__cause__ is error
+        assert f"action={action}" in caplog.text
+        assert f"exception={type(error).__name__}" in caplog.text
+        assert f"category={category}" in caplog.text
+        for secret in ("2468", "proof-secret", "activation-secret", "bearer-secret"):
+            assert secret not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_proof_failure_is_identified_without_secret_logging(self, caplog):
+        actions = make_actions(spin="2468")
+        error = ConnectionError("proof-secret bearer-secret 2468")
+        actions._api.request_once.side_effect = error
+
+        with caplog.at_level("ERROR", logger="audi_connect.actions"):
+            with pytest.raises(ActionFailedError) as raised:
+                await actions.start_engine("WAUTEST")
+
+        assert raised.value.__cause__ is error
+        assert "action=engine_start" in caplog.text
+        assert "phase=userpromptproof" in caplog.text
+        assert "category=transport" in caplog.text
+        for secret in ("2468", "proof-secret", "bearer-secret"):
+            assert secret not in caplog.text
+
+
 class TestEngineStopTransport:
     @pytest.mark.asyncio
     async def test_stop_is_single_attempt_without_body_spin_or_redirects(self):
@@ -557,6 +748,42 @@ class TestDurableStateMachine:
         restarted._vehicle_data = vehicle._vehicle_data
         with pytest.raises(ActionInProgressError):
             await restarted.stop_engine()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("action", ["engine_start", "engine_stop"])
+    async def test_diagnostic_logging_preserves_durable_ambiguous_state(
+        self,
+        tmp_path,
+        caplog,
+        action,
+    ):
+        vehicle, auth, store = make_vehicle(tmp_path)
+        actions = make_actions()
+        error = ConnectionError("transport detail with proof-secret 1234")
+        if action == "engine_start":
+            actions._api.request_once.side_effect = [
+                {"userPromptProof": "proof-secret"},
+                error,
+            ]
+            auth.start_engine.side_effect = actions.start_engine
+            operation = vehicle.start_engine()
+        else:
+            actions._api.request_once.side_effect = error
+            auth.stop_engine.side_effect = actions.stop_engine
+            operation = vehicle.stop_engine()
+
+        with caplog.at_level("ERROR", logger="audi_connect.actions"):
+            with pytest.raises(AmbiguousActionError):
+                await operation
+
+        active = store.active_for("WAUTEST")
+        assert active["action"] == action
+        assert active["status"] == "ambiguous"
+        assert active["request_id"] is None
+        assert f"action={action}" in caplog.text
+        assert "category=transport" in caplog.text
+        assert "proof-secret" not in caplog.text
+        assert "1234" not in caplog.text
 
     @pytest.mark.asyncio
     async def test_restart_with_submitting_blocks_start(self, tmp_path):

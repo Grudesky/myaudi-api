@@ -16,6 +16,43 @@ TIMEOUT = 30
 MAX_RETRIES = 3
 _LOGGER = logging.getLogger(__name__)
 
+_SAFE_ERROR_BODY_FIELDS = frozenset(
+    {
+        "code",
+        "detail",
+        "error",
+        "errorCode",
+        "message",
+        "reason",
+        "status",
+    }
+)
+
+
+def _safe_error_body_summary(raw_body: str) -> str:
+    """Describe an HTTP error body without retaining or logging its values."""
+    size = len(raw_body.encode("utf-8", errors="replace"))
+    try:
+        parsed = json.loads(raw_body)
+    except (json.JSONDecodeError, TypeError):
+        return f"non_json bytes={size}"
+
+    if not isinstance(parsed, dict):
+        return f"json_{type(parsed).__name__} bytes={size}"
+
+    fields = sorted(set(parsed).intersection(_SAFE_ERROR_BODY_FIELDS))
+    error_fields: list[str] = []
+    if isinstance(parsed.get("error"), dict):
+        error_fields = sorted(
+            set(parsed["error"]).intersection(_SAFE_ERROR_BODY_FIELDS)
+        )
+
+    field_text = ",".join(fields) or "none"
+    result = f"json_object fields={field_text} bytes={size}"
+    if error_fields:
+        result += f" error_fields={','.join(error_fields)}"
+    return result
+
 
 class AudiAPI:
     HDR_XAPP_VERSION: str = "4.31.0"
@@ -118,12 +155,19 @@ class AudiAPI:
                         return json.loads(raw_body)
 
                     else:
-                        raise ClientResponseError(
+                        try:
+                            raw_body = await response.text()
+                            safe_body_summary = _safe_error_body_summary(raw_body)
+                        except Exception:
+                            safe_body_summary = "unavailable"
+                        error = ClientResponseError(
                             response.request_info,
                             response.history,
                             status=response.status,
                             message=response.reason,
                         )
+                        error.safe_response_body = safe_body_summary
+                        raise error
 
         except TimeoutError:
             raise RequestTimeoutError(f"Request timed out after {TIMEOUT}s: {url}")
