@@ -86,6 +86,7 @@ AUDI_WEBHOOK_URL=https://n8n.example.com/webhook/audi
 | `AUDI_SPIN` | S-PIN for lock/unlock and remote engine start | (optional) |
 | `AUDI_API_LEVEL` | `0` = legacy MBB, `1` = new CARIAD API | `1` |
 | `AUDI_DEFAULT_VIN` | Default VIN — skip `--vin` for single-vehicle users | (optional) |
+| `AUDI_ENGINE_CONTROL_VINS` | Comma-separated VIN allowlist for remote engine start/stop; matching is case-insensitive and whitespace-tolerant | (empty; engine control disabled) |
 | `AUDI_WEBHOOK_URL` | Webhook URL for state change notifications | (optional) |
 | `AUDI_WEBHOOK_SECRET` | If set, webhooks are signed with HMAC-SHA256 in the `X-Audi-Signature` header | (optional) |
 | `AUDI_WATCH_INTERVAL` | Background poll interval in seconds (API server only) | `0` (disabled) |
@@ -229,8 +230,8 @@ Every request gets an `X-Request-ID` header (provided by the client if present, 
 | `POST` | `/{vin}/climate/stop` | X-API-Key | Stop climate |
 | `POST` | `/{vin}/heater/start` | X-API-Key | Start heater (`?duration=30&confirm=true`) |
 | `POST` | `/{vin}/heater/stop` | X-API-Key | Stop heater |
-| `POST` | `/{vin}/engine/start` | X-API-Key | Start a supported gasoline engine; returns CARIAD request ID |
-| `POST` | `/{vin}/engine/stop` | X-API-Key | Stop a supported gasoline engine; returns CARIAD request ID |
+| `POST` | `/{vin}/engine/start` | X-API-Key | Start an explicitly allowlisted gasoline engine; returns CARIAD request ID |
+| `POST` | `/{vin}/engine/stop` | X-API-Key | Stop an explicitly allowlisted gasoline engine; returns CARIAD request ID |
 | `GET` | `/{vin}/actions/{request_id}` | X-API-Key | Query a CARIAD engine-action result |
 | `GET` | `/{vin}/engine/action` | X-API-Key | Inspect the durable unresolved engine-action guard |
 | `POST` | `/{vin}/engine/actions/{local_action_id}/recover?confirm=true` | X-API-Key | Explicitly release an unresolved guard without a vehicle command |
@@ -242,6 +243,19 @@ Cache is automatically invalidated after any action so the next `GET /status` re
 Engine actions are the exception: they are confirmed through CARIAD
 `pendingrequests` and never invalidate or force-refresh vehicle status, so they
 do not alter the live-poll cooldown.
+
+Remote engine endpoints are disabled unless the requested VIN is explicitly
+listed in `AUDI_ENGINE_CONTROL_VINS`. For example:
+
+```env
+AUDI_ENGINE_CONTROL_VINS=WA16AAGU2T2033252
+AUDI_ENGINE_ACTION_STATE_FILE=/data/engine-actions.json
+```
+
+Multiple VINs may be comma-separated. The current `userCapabilities` snapshot
+continues to record whether CARIAD advertises literal `engineControl`, but that
+diagnostic snapshot is not the authorization gate and need not be refreshed
+after a process restart before an allowlisted engine action.
 
 **Rate limiting**: read endpoints allow 30 requests/min, action endpoints allow 5 requests/min. Exceeding returns HTTP 429. The `/health`, `/ready` and `/metrics` endpoints are not rate-limited and don't require `X-API-Key` — they are intended for kubelet probes and Prometheus scraping.
 

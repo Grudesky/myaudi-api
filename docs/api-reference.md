@@ -182,7 +182,9 @@ curl -H "X-API-Key: $AUDI_API_KEY" "http://localhost:8000/last-parked?vin=WAUXXX
 ### `POST /{vin}/engine/start`
 
 - Auth: `X-API-Key`; `AUDI_SPIN` must be configured.
-- Rate limit: 5/min. The vehicle must literally advertise `engineControl`.
+- Rate limit: 5/min. The VIN must be explicitly listed in the comma-separated
+  `AUDI_ENGINE_CONTROL_VINS` configuration. Matching is case-insensitive and
+  whitespace-tolerant; unset or empty configuration disables engine control.
 - Obtains a CARIAD `userPromptProof`, submits it with the S-PIN, and returns
   `{"status": "sent", "action": "engine_start", "vin", "request_id"}`.
 - The start submission is non-idempotent and is attempted exactly once. An
@@ -193,12 +195,17 @@ curl -H "X-API-Key: $AUDI_API_KEY" "http://localhost:8000/last-parked?vin=WAUXXX
 
 ### `POST /{vin}/engine/stop`
 
-- Auth: `X-API-Key`. Rate limit: 5/min. The vehicle must advertise
-  `engineControl`.
+- Auth: `X-API-Key`. Rate limit: 5/min. The VIN must be explicitly listed in
+  `AUDI_ENGINE_CONTROL_VINS`.
 - Returns the same shape with `action: "engine_stop"` and the CARIAD request ID.
 - Stop is also attempted exactly once because its transport retry safety has
   not been independently established. It uses the same durable unresolved
   guard as start.
+
+The selective-status `userCapabilities` job and literal `engineControl`
+parsing remain available as diagnostics. Capability data is not fetched by an
+engine action and is not its runtime authorization gate; support is never
+inferred from engine type, ignition, readiness, model, or fuel fields.
 
 ### `GET /{vin}/actions/{request_id}`
 
@@ -225,6 +232,8 @@ curl -H "X-API-Key: $AUDI_API_KEY" "http://localhost:8000/last-parked?vin=WAUXXX
 
 The API server requires `AUDI_ENGINE_ACTION_STATE_FILE` to point to a durable
 volume; engine commands fail closed with 503 when it is unset or unreadable.
+It also requires the requested VIN in `AUDI_ENGINE_CONTROL_VINS`; an unlisted
+VIN is rejected locally before any Audi authentication or vehicle request.
 The fixed-schema file contains only VIN, action, normalized state,
 timestamps, a local action ID, and the CARIAD request ID when known. It never
 contains authentication headers, tokens, S-PIN, `userPromptProof`, or

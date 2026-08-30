@@ -176,6 +176,7 @@ class TestParallelUpdate:
         assert v.raw_vehicle_data is raw
         assert v.raw_vehicle_data["userCapabilities"] == raw["userCapabilities"]
         assert v.capability_ids == ("engineType", "ignition", "readiness")
+        assert v.engine_control_capability_advertised is False
         assert "capabilities" not in v.get_dashboard()
 
     @pytest.mark.asyncio

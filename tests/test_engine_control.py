@@ -43,7 +43,12 @@ def make_actions(*, country="US", spin="1234"):
     )
 
 
-def make_vehicle(tmp_path, capability_ids=("engineControl",), history_limit=50):
+def make_vehicle(
+    tmp_path,
+    capability_ids=("engineControl",),
+    history_limit=50,
+    engine_control_enabled=True,
+):
     auth = MagicMock()
 
     async def submit_start(vin, on_submission_begin):
@@ -62,6 +67,7 @@ def make_vehicle(tmp_path, capability_ids=("engineControl",), history_limit=50):
         auth,
         {"vin": "WAUTEST"},
         engine_action_store=store,
+        engine_control_enabled=engine_control_enabled,
     )
     vehicle._vehicle_data = VehicleDataResponse(
         {
@@ -378,18 +384,41 @@ async def test_real_http_layer_does_not_retry_engine_start_post():
 class TestDurableStateMachine:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "capability_ids", [(), ("engineType",), ("ignition",), ("readiness",)]
+        "capability_ids",
+        [(), ("engineType",), ("ignition",), ("readiness",), ("engineControl",)],
     )
-    async def test_start_requires_literal_engine_control(self, tmp_path, capability_ids):
+    async def test_configured_start_does_not_require_capability_snapshot(
+        self,
+        tmp_path,
+        capability_ids,
+    ):
         vehicle, auth, _ = make_vehicle(tmp_path, capability_ids)
-        with pytest.raises(CapabilityNotSupportedError, match="engineControl"):
+        assert await vehicle.start_engine() == "request-start"
+        auth.start_engine.assert_awaited_once()
+        assert vehicle.engine_control_capability_advertised is (
+            "engineControl" in capability_ids
+        )
+        auth.get_stored_vehicle_data.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unconfigured_vehicle_fails_closed_before_submission(self, tmp_path):
+        vehicle, auth, _ = make_vehicle(
+            tmp_path,
+            capability_ids=("engineControl",),
+            engine_control_enabled=False,
+        )
+        with pytest.raises(CapabilityNotSupportedError, match="configuration"):
             await vehicle.start_engine()
         auth.start_engine.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_durable_store_is_required(self):
         auth = MagicMock()
-        vehicle = AudiVehicle(auth, {"vin": "WAUTEST"})
+        vehicle = AudiVehicle(
+            auth,
+            {"vin": "WAUTEST"},
+            engine_control_enabled=True,
+        )
         vehicle._vehicle_data = VehicleDataResponse(
             {"userCapabilities": {"capabilitiesStatus": {"value": [{"id": "engineControl"}]}}}
         )
@@ -451,6 +480,7 @@ class TestDurableStateMachine:
             auth,
             {"vin": "WAUTEST"},
             engine_action_store=EngineActionStore(store.path),
+            engine_control_enabled=True,
         )
         restarted._vehicle_data = vehicle._vehicle_data
         with pytest.raises(ActionInProgressError):
@@ -500,6 +530,7 @@ class TestDurableStateMachine:
             auth,
             {"vin": "WAUTEST"},
             engine_action_store=EngineActionStore(store.path),
+            engine_control_enabled=True,
         )
         restarted._vehicle_data = vehicle._vehicle_data
         with pytest.raises(ActionInProgressError):
@@ -521,6 +552,7 @@ class TestDurableStateMachine:
             auth,
             {"vin": "WAUTEST"},
             engine_action_store=EngineActionStore(store.path),
+            engine_control_enabled=True,
         )
         restarted._vehicle_data = vehicle._vehicle_data
         with pytest.raises(ActionInProgressError):
@@ -682,6 +714,7 @@ class TestDurableStateMachine:
             auth,
             {"vin": "WAUTEST"},
             engine_action_store=store,
+            engine_control_enabled=True,
         )
         vehicle._vehicle_data = VehicleDataResponse(
             {"userCapabilities": {"capabilitiesStatus": {"value": [{"id": "engineControl"}]}}}

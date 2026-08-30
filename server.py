@@ -99,6 +99,20 @@ AUDI_COUNTRY = os.getenv("AUDI_COUNTRY", "DE")
 AUDI_SPIN = os.getenv("AUDI_SPIN")
 AUDI_API_LEVEL = int(os.getenv("AUDI_API_LEVEL", "1"))
 
+
+def parse_engine_control_vins(value: Optional[str]) -> frozenset[str]:
+    """Parse the explicitly authorized engine-control VIN allowlist."""
+    return frozenset(
+        vin.strip().upper()
+        for vin in (value or "").split(",")
+        if vin.strip()
+    )
+
+
+AUDI_ENGINE_CONTROL_VINS = parse_engine_control_vins(
+    os.getenv("AUDI_ENGINE_CONTROL_VINS")
+)
+
 # API key required on all endpoints except /health.
 # When unset, protected endpoints fail-closed with 503 to avoid an open API.
 AUDI_API_KEY = os.getenv("AUDI_API_KEY", "")
@@ -345,6 +359,10 @@ class AudiClient:
                     self._auth,
                     v,
                     engine_action_store=self._engine_action_store,
+                    engine_control_enabled=(
+                        v.get("vin", "").strip().upper()
+                        in AUDI_ENGINE_CONTROL_VINS
+                    ),
                 )
                 for v in vehicle_list
             ]
@@ -671,6 +689,14 @@ def _get_vehicle_or_404(vin: str) -> AudiVehicle:
     return vehicle
 
 
+def _require_engine_control_vin(vin: str) -> None:
+    if vin.strip().upper() not in AUDI_ENGINE_CONTROL_VINS:
+        raise HTTPException(
+            status_code=403,
+            detail="Engine control is not enabled for this VIN",
+        )
+
+
 # --- Health ---
 @app.get("/health")
 @limiter.limit("60/minute")
@@ -943,6 +969,7 @@ async def stop_heater(request: Request, vin: str, confirm: bool = Query(False)):
 @app.post("/{vin}/engine/start", dependencies=[Depends(require_api_key)])
 @limiter.limit("5/minute")
 async def start_engine(request: Request, vin: str):
+    _require_engine_control_vin(vin)
     await _require_auth()
     vehicle = _get_vehicle_or_404(vin)
     try:
@@ -982,6 +1009,7 @@ async def start_engine(request: Request, vin: str):
 @app.post("/{vin}/engine/stop", dependencies=[Depends(require_api_key)])
 @limiter.limit("5/minute")
 async def stop_engine(request: Request, vin: str):
+    _require_engine_control_vin(vin)
     await _require_auth()
     vehicle = _get_vehicle_or_404(vin)
     try:

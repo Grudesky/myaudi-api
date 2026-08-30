@@ -39,6 +39,17 @@ server intentionally has no container-filesystem default: without this setting,
 engine endpoints fail closed with 503. A pod recreation must preserve this file
 or the at-most-once crash guard cannot be guaranteed.
 
+Engine control must also be explicitly enabled per VIN with the comma-separated
+`AUDI_ENGINE_CONTROL_VINS` environment variable. For this deployment:
+
+```env
+AUDI_ENGINE_CONTROL_VINS=WA16AAGU2T2033252
+```
+
+Unset or empty configuration disables start and stop for every VIN. The
+allowlist is independent of the latest selective-status capability snapshot and
+does not add an Audi/CARIAD request.
+
 ## Secrets
 
 Sealed-secrets, NOT raw `kubectl create secret`. The plaintext never lands in any repo.
@@ -47,7 +58,8 @@ Sealed-secrets, NOT raw `kubectl create secret`. The plaintext never lands in an
 - Required keys:
   - `AUDI_USERNAME`
   - `AUDI_PASSWORD`
-  - `AUDI_SPIN` (only if you want lock/unlock; otherwise omit and the server runs without those endpoints' write capability)
+  - `AUDI_SPIN` (required for lock/unlock and remote engine start; otherwise omit it)
+  - `AUDI_ENGINE_CONTROL_VINS` — explicit comma-separated allowlist when remote engine control is enabled
   - `AUDI_API_KEY` — strongly recommended; without it, all protected endpoints return 503
   - `AUDI_WEBHOOK_SECRET` — only if `AUDI_WEBHOOK_URL` is also set and you want signed webhooks
 - Referenced in `deployment.yaml` via `envFrom: - secretRef: name: audi-credentials`.

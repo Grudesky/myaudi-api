@@ -51,6 +51,7 @@ class AudiVehicle:
         auth: AudiAuth,
         vehicle_info: dict,
         engine_action_store: Optional[EngineActionStore] = None,
+        engine_control_enabled: bool = False,
     ):
         self._auth = auth
         self.vin: str = vehicle_info.get("vin", "")
@@ -81,6 +82,7 @@ class AudiVehicle:
         self._trip_longterm: Optional[TripDataResponse] = None
         self._engine_action_lock = asyncio.Lock()
         self._engine_action_store = engine_action_store
+        self._engine_control_enabled = engine_control_enabled
         self._engine_actions: dict[str, dict] = {}
         self._active_engine_action: Optional[dict] = None
         self._engine_action_state_error = False
@@ -159,6 +161,11 @@ class AudiVehicle:
     def capability_ids(self) -> tuple[str, ...]:
         """Literal capability IDs advertised by CARIAD, without support inference."""
         return self._vehicle_data.capability_ids if self._vehicle_data else ()
+
+    @property
+    def engine_control_capability_advertised(self) -> bool:
+        """Whether the latest CARIAD capability snapshot advertises engine control."""
+        return "engineControl" in self.capability_ids
 
     @property
     def engine_actions(self) -> dict[str, dict]:
@@ -818,9 +825,9 @@ class AudiVehicle:
             return recovered
 
     def _require_engine_control(self) -> None:
-        if "engineControl" not in self.capability_ids:
+        if not self._engine_control_enabled:
             raise CapabilityNotSupportedError(
-                "Vehicle does not advertise the engineControl capability"
+                "Engine control is not enabled by configuration for this vehicle"
             )
 
     def _require_engine_action_store(self) -> EngineActionStore:

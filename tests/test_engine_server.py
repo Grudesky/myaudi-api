@@ -9,6 +9,7 @@ from audi_connect.exceptions import ActionPersistenceError
 
 @pytest.fixture
 def engine_client(monkeypatch):
+    api_module.limiter.reset()
     vehicle = MagicMock()
     vehicle.vin = "WAUTEST"
     vehicle.start_engine = AsyncMock(return_value="request-start")
@@ -37,6 +38,11 @@ def engine_client(monkeypatch):
     )
     monkeypatch.setattr(api_module, "AUDI_API_KEY", "test-key")
     monkeypatch.setattr(
+        api_module,
+        "AUDI_ENGINE_CONTROL_VINS",
+        frozenset({"WAUTEST"}),
+    )
+    monkeypatch.setattr(
         api_module.client,
         "ensure_auth",
         AsyncMock(return_value=True),
@@ -59,6 +65,119 @@ def assert_polling_untouched(vehicle):
     api_module.client.live_update_vehicles.assert_not_awaited()
     api_module.client._save_live_poll_state.assert_not_called()
     vehicle._fetch_vehicle_data.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, frozenset()),
+        ("", frozenset()),
+        ("   ", frozenset()),
+        (
+            "  wautest , WAUOTHER  ,wauthird ",
+            frozenset({"WAUTEST", "WAUOTHER", "WAUTHIRD"}),
+        ),
+    ],
+)
+def test_engine_control_vin_allowlist_parsing(value, expected):
+    assert api_module.parse_engine_control_vins(value) == expected
+
+
+@pytest.mark.asyncio
+async def test_login_applies_engine_allowlist_without_status_poll(monkeypatch):
+    auth = MagicMock()
+    auth.login = AsyncMock(
+        return_value=[{"vin": "wautest"}, {"vin": "WAUOTHER"}]
+    )
+    monkeypatch.setattr(api_module, "AUDI_ENGINE_CONTROL_VINS", frozenset({"WAUTEST"}))
+    monkeypatch.setattr(api_module, "AudiAPI", MagicMock())
+    monkeypatch.setattr(api_module, "AudiAuth", MagicMock(return_value=auth))
+    client = api_module.AudiClient()
+    client._session = MagicMock()
+
+    assert await client.login() is True
+
+    assert client.vehicles[0]._engine_control_enabled is True
+    assert client.vehicles[1]._engine_control_enabled is False
+    auth.get_stored_vehicle_data.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("path", "method_name"),
+    [
+        ("/WAUTEST/engine/start", "start_engine"),
+        ("/WAUTEST/engine/stop", "stop_engine"),
+    ],
+)
+def test_configured_vin_works_without_capability_snapshot_after_restart(
+    engine_client,
+    path,
+    method_name,
+):
+    test_client, vehicle = engine_client
+    vehicle.capability_ids = ()
+
+    response = test_client.post(
+        path,
+        headers={"X-API-Key": "test-key"},
+    )
+
+    assert response.status_code == 200
+    getattr(vehicle, method_name).assert_awaited_once_with()
+    assert_polling_untouched(vehicle)
+
+
+def test_configured_vin_works_with_engine_control_capability(engine_client):
+    test_client, vehicle = engine_client
+    vehicle.capability_ids = ("engineControl",)
+
+    response = test_client.post(
+        "/WAUTEST/engine/start",
+        headers={"X-API-Key": "test-key"},
+    )
+
+    assert response.status_code == 200
+    vehicle.start_engine.assert_awaited_once_with()
+    assert_polling_untouched(vehicle)
+
+
+def test_engine_control_vin_comparison_is_case_insensitive(engine_client):
+    test_client, vehicle = engine_client
+
+    response = test_client.post(
+        "/wautest/engine/start",
+        headers={"X-API-Key": "test-key"},
+    )
+
+    assert response.status_code == 200
+    vehicle.start_engine.assert_awaited_once_with()
+
+
+@pytest.mark.parametrize("allowlist", [frozenset(), frozenset({"WAUOTHER"})])
+@pytest.mark.parametrize("action", ["start", "stop"])
+def test_unconfigured_or_empty_allowlist_rejects_locally(
+    engine_client,
+    monkeypatch,
+    allowlist,
+    action,
+):
+    test_client, vehicle = engine_client
+    monkeypatch.setattr(api_module, "AUDI_ENGINE_CONTROL_VINS", allowlist)
+
+    response = test_client.post(
+        f"/WAUTEST/engine/{action}",
+        headers={"X-API-Key": "test-key"},
+    )
+
+    assert response.status_code == 403
+    assert response.json() == {
+        "detail": "Engine control is not enabled for this VIN"
+    }
+    api_module.client.ensure_auth.assert_not_awaited()
+    api_module.client.get_vehicle.assert_not_called()
+    vehicle.start_engine.assert_not_awaited()
+    vehicle.stop_engine.assert_not_awaited()
+    assert_polling_untouched(vehicle)
 
 
 def test_engine_start_endpoint_returns_request_id_without_refresh(engine_client):
