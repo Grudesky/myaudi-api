@@ -424,7 +424,6 @@ class AudiClient:
             try:
                 for vehicle in self.vehicles:
                     await vehicle._fetch_vehicle_data(raise_on_error=True)
-                    await vehicle._fetch_position()
             except ClientResponseError as e:
                 if e.status != 401:
                     raise
@@ -439,7 +438,6 @@ class AudiClient:
 
                 for vehicle in self.vehicles:
                     await vehicle._fetch_vehicle_data(raise_on_error=True)
-                    await vehicle._fetch_position()
 
             completed = time.time()
             self._last_live_poll = completed

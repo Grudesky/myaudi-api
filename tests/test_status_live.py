@@ -82,3 +82,33 @@ def test_status_force_bypasses_live_poll_cooldown(status_client, monkeypatch):
     assert response.status_code == 200
     assert response.json()["status"] == "live"
     live_update.assert_awaited_once_with(force=True)
+
+
+@pytest.mark.parametrize("path", ["/status", "/status?force=true"])
+def test_status_live_request_fetches_selective_status_only(
+    status_client,
+    monkeypatch,
+    path,
+):
+    vehicle = MagicMock()
+    vehicle.vin = "WAUTEST"
+    vehicle.model = "Q5"
+    vehicle.title = "Test vehicle"
+    vehicle._fetch_vehicle_data = AsyncMock(return_value=None)
+    vehicle._fetch_position = AsyncMock(return_value=None)
+    vehicle._fetch_trip = AsyncMock(return_value=None)
+    vehicle.get_dashboard.return_value = {}
+    monkeypatch.setattr(api_module.client, "vehicles", [vehicle])
+    monkeypatch.setattr(api_module.client, "_last_live_poll", 0.0)
+    monkeypatch.setattr(api_module.client, "_save_live_poll_state", MagicMock())
+
+    response = status_client.get(
+        path,
+        headers={"X-API-Key": "test-key"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "live"
+    vehicle._fetch_vehicle_data.assert_awaited_once_with(raise_on_error=True)
+    vehicle._fetch_position.assert_not_awaited()
+    vehicle._fetch_trip.assert_not_awaited()
