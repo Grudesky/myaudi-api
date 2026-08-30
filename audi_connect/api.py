@@ -3,6 +3,7 @@
 import json
 import logging
 import asyncio
+import re
 from typing import Any, Optional, Union
 from asyncio import TimeoutError
 from aiohttp import ClientSession, ClientResponse, ClientResponseError
@@ -28,6 +29,52 @@ _SAFE_ERROR_BODY_FIELDS = frozenset(
     }
 )
 
+_SAFE_ERROR_HINT_PATTERNS = (
+    ("securedActivationData", re.compile(r"(?<![A-Za-z0-9])securedActivationData(?![A-Za-z0-9])", re.IGNORECASE)),
+    ("userPromptProof", re.compile(r"(?<![A-Za-z0-9])userPromptProof(?![A-Za-z0-9])", re.IGNORECASE)),
+    ("spin", re.compile(r"(?<![A-Za-z0-9])spin(?![A-Za-z0-9])", re.IGNORECASE)),
+    ("requestID", re.compile(r"(?<![A-Za-z0-9])requestID(?![A-Za-z0-9])")),
+    ("requestId", re.compile(r"(?<![A-Za-z0-9])requestId(?![A-Za-z0-9])")),
+    ("validation", re.compile(r"(?<![A-Za-z0-9])validation(?![A-Za-z0-9])", re.IGNORECASE)),
+    ("invalid", re.compile(r"(?<![A-Za-z0-9])invalid(?![A-Za-z0-9])", re.IGNORECASE)),
+    ("missing", re.compile(r"(?<![A-Za-z0-9])missing(?![A-Za-z0-9])", re.IGNORECASE)),
+    ("required", re.compile(r"(?<![A-Za-z0-9])required(?![A-Za-z0-9])", re.IGNORECASE)),
+    ("malformed", re.compile(r"(?<![A-Za-z0-9])malformed(?![A-Za-z0-9])", re.IGNORECASE)),
+    ("unauthorized", re.compile(r"(?<![A-Za-z0-9])unauthorized(?![A-Za-z0-9])", re.IGNORECASE)),
+    ("forbidden", re.compile(r"(?<![A-Za-z0-9])forbidden(?![A-Za-z0-9])", re.IGNORECASE)),
+    ("expired", re.compile(r"(?<![A-Za-z0-9])expired(?![A-Za-z0-9])", re.IGNORECASE)),
+    ("unsupported", re.compile(r"(?<![A-Za-z0-9])unsupported(?![A-Za-z0-9])", re.IGNORECASE)),
+)
+_SAFE_ERROR_HINT_MAX_DEPTH = 6
+_SAFE_ERROR_HINT_MAX_TEXTS = 200
+_SAFE_ERROR_HINT_MAX_TEXT_LENGTH = 4096
+
+
+def _safe_error_hints(parsed: Any) -> str:
+    """Classify known protocol terms without retaining response values."""
+    texts: list[str] = []
+    pending: list[tuple[Any, int]] = [(parsed, 0)]
+    while pending and len(texts) < _SAFE_ERROR_HINT_MAX_TEXTS:
+        value, depth = pending.pop()
+        if isinstance(value, str):
+            texts.append(value[:_SAFE_ERROR_HINT_MAX_TEXT_LENGTH])
+        elif isinstance(value, dict) and depth < _SAFE_ERROR_HINT_MAX_DEPTH:
+            for key, item in value.items():
+                if len(texts) >= _SAFE_ERROR_HINT_MAX_TEXTS:
+                    break
+                if isinstance(key, str):
+                    texts.append(key[:_SAFE_ERROR_HINT_MAX_TEXT_LENGTH])
+                pending.append((item, depth + 1))
+        elif isinstance(value, list) and depth < _SAFE_ERROR_HINT_MAX_DEPTH:
+            pending.extend((item, depth + 1) for item in value)
+
+    hints = [
+        label
+        for label, pattern in _SAFE_ERROR_HINT_PATTERNS
+        if any(pattern.search(text) for text in texts)
+    ]
+    return ",".join(hints) or "unclassified"
+
 
 def _safe_error_body_summary(raw_body: str) -> str:
     """Describe an HTTP error body without retaining or logging its values."""
@@ -35,10 +82,12 @@ def _safe_error_body_summary(raw_body: str) -> str:
     try:
         parsed = json.loads(raw_body)
     except (json.JSONDecodeError, TypeError):
-        return f"non_json bytes={size}"
+        return f"non_json bytes={size} error_hint=unclassified"
+
+    error_hint = _safe_error_hints(parsed)
 
     if not isinstance(parsed, dict):
-        return f"json_{type(parsed).__name__} bytes={size}"
+        return f"json_{type(parsed).__name__} bytes={size} error_hint={error_hint}"
 
     fields = sorted(set(parsed).intersection(_SAFE_ERROR_BODY_FIELDS))
     error_fields: list[str] = []
@@ -51,6 +100,7 @@ def _safe_error_body_summary(raw_body: str) -> str:
     result = f"json_object fields={field_text} bytes={size}"
     if error_fields:
         result += f" error_fields={','.join(error_fields)}"
+    result += f" error_hint={error_hint}"
     return result
 
 

@@ -255,6 +255,7 @@ class TestEngineActionDiagnostics:
             assert "reason=Forbidden" in log_text
             assert "response_body=json_object" in log_text
             assert "error_fields=code,message" in log_text
+            assert "error_hint=spin" in log_text
             for secret in (
                 "2468",
                 "proof-secret",
@@ -262,6 +263,130 @@ class TestEngineActionDiagnostics:
                 "bearer-secret",
             ):
                 assert secret not in log_text
+        finally:
+            await session.close()
+
+    @pytest.mark.asyncio
+    async def test_http_error_logs_only_fixed_semantic_hints(self, caplog):
+        session = aiohttp.ClientSession()
+        try:
+            api = AudiAPI(session)
+            actions = AudiVehicleActions(
+                api,
+                AudiEndpoints(api, country="US", api_level=1),
+                {"access_token": "bearer-secret"},
+                {"access_token": "vw-secret"},
+                "xclient",
+                "US",
+                "2468",
+                1,
+            )
+            proof_url = (
+                "https://na.bff.cariad.digital/vehicle/v1/engine/"
+                "WAUTEST/userpromptproof"
+            )
+            start_url = (
+                "https://na.bff.cariad.digital/vehicle/v1/engine/"
+                "WAUTEST/start"
+            )
+            raw_message = (
+                "validation invalid missing required malformed unauthorized "
+                "forbidden expired unsupported arbitrary-message-secret"
+            )
+            with aioresponses() as mocked:
+                mocked.put(
+                    proof_url,
+                    payload={"userPromptProof": "proof-secret"},
+                )
+                mocked.post(
+                    start_url,
+                    status=400,
+                    reason="Bad Request",
+                    payload={
+                        "error": {
+                            "message": raw_message,
+                            "securedActivationData": "activation-secret",
+                            "userPromptProof": "proof-secret",
+                            "spin": "2468",
+                            "requestID": "request-id-secret",
+                            "requestId": "alternate-request-secret",
+                        },
+                        "vin": "WAU-SECRET-VIN",
+                        "Authorization": "Bearer bearer-secret",
+                        "Cookie": "session=cookie-secret",
+                        "refresh_token": "refresh-secret",
+                    },
+                )
+                with caplog.at_level("ERROR", logger="audi_connect.actions"):
+                    with pytest.raises(AmbiguousActionError) as raised:
+                        await actions.start_engine("WAUTEST")
+
+            assert isinstance(raised.value.__cause__, aiohttp.ClientResponseError)
+            assert raised.value.__cause__.status == 400
+            assert (
+                "error_hint=securedActivationData,userPromptProof,spin,requestID,"
+                "requestId,validation,invalid,missing,required,malformed,"
+                "unauthorized,forbidden,expired,unsupported"
+            ) in caplog.text
+            assert raw_message not in caplog.text
+            for secret in (
+                "2468",
+                "activation-secret",
+                "proof-secret",
+                "request-id-secret",
+                "alternate-request-secret",
+                "WAU-SECRET-VIN",
+                "bearer-secret",
+                "cookie-secret",
+                "refresh-secret",
+            ):
+                assert secret not in caplog.text
+            assert "Authorization" not in caplog.text
+            assert "Cookie" not in caplog.text
+        finally:
+            await session.close()
+
+    @pytest.mark.asyncio
+    async def test_http_error_without_known_terms_is_unclassified(self, caplog):
+        session = aiohttp.ClientSession()
+        try:
+            api = AudiAPI(session)
+            actions = AudiVehicleActions(
+                api,
+                AudiEndpoints(api, country="US", api_level=1),
+                {"access_token": "bearer-secret"},
+                {"access_token": "vw-secret"},
+                "xclient",
+                "US",
+                "2468",
+                1,
+            )
+            proof_url = (
+                "https://na.bff.cariad.digital/vehicle/v1/engine/"
+                "WAUTEST/userpromptproof"
+            )
+            start_url = (
+                "https://na.bff.cariad.digital/vehicle/v1/engine/"
+                "WAUTEST/start"
+            )
+            with aioresponses() as mocked:
+                mocked.put(
+                    proof_url,
+                    payload={"userPromptProof": "proof-secret"},
+                )
+                mocked.post(
+                    start_url,
+                    status=400,
+                    reason="Bad Request",
+                    payload={"error": {"message": "opaque-secret-detail"}},
+                )
+                with caplog.at_level("ERROR", logger="audi_connect.actions"):
+                    with pytest.raises(AmbiguousActionError) as raised:
+                        await actions.start_engine("WAUTEST")
+
+            assert isinstance(raised.value.__cause__, aiohttp.ClientResponseError)
+            assert "error_hint=unclassified" in caplog.text
+            assert "opaque-secret-detail" not in caplog.text
         finally:
             await session.close()
 
