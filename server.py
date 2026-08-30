@@ -77,7 +77,8 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from audi_connect.api import AudiAPI
 from audi_connect.auth import AudiAuth
 from audi_connect.engine_actions import EngineActionStore
-from audi_connect.vehicle import AudiVehicle
+from audi_connect.position_state import PositionStateError, PositionStateStore
+from audi_connect.vehicle import AudiVehicle, LegacyPositionUpdate
 from audi_connect.watcher import check_vehicles
 from audi_connect.exceptions import (
     ActionInProgressError,
@@ -129,6 +130,12 @@ LIVE_POLL_STATE_FILE = Path(
     os.getenv(
         "AUDI_LIVE_POLL_STATE_FILE",
         str(Path.home() / ".myaudi-api" / "live-poll-state.json"),
+    )
+)
+POSITION_STATE_FILE = Path(
+    os.getenv(
+        "AUDI_POSITION_STATE_FILE",
+        str(Path.home() / ".myaudi-api" / "position-state.json"),
     )
 )
 _engine_action_state_path = os.getenv("AUDI_ENGINE_ACTION_STATE_FILE")
@@ -247,6 +254,12 @@ class AudiClient:
         self._last_update = 0.0
         self._last_live_poll = 0.0
         self._update_lock = asyncio.Lock()
+        self._position_state_store = PositionStateStore(POSITION_STATE_FILE)
+        if not self._position_state_store.usable:
+            log.warning(
+                "Automatic parking-position refresh disabled: state file is unreadable (%s)",
+                self._position_state_store.load_error,
+            )
         # The API server has no safe default: its container filesystem may be
         # ephemeral. Engine commands remain disabled until an operator supplies
         # a path backed by durable storage.
@@ -366,6 +379,7 @@ class AudiClient:
                 )
                 for v in vehicle_list
             ]
+            self._restore_positions()
 
             self.authenticated = True
             self._auth_time = time.time()
@@ -379,6 +393,117 @@ class AudiClient:
             self.authenticated = False
             audi_auth_refresh_total.labels(result="failure").inc()
             return False
+
+    def _restore_positions(self) -> None:
+        """Restore accepted positions without making an Audi request."""
+        if not self._position_state_store.usable:
+            return
+        for vehicle in self.vehicles:
+            try:
+                state = self._position_state_store.state_for(vehicle.vin)
+            except PositionStateError as exc:
+                log.warning("Could not restore parking-position state: %s", exc)
+                return
+            if state is not None and state["accepted_position"] is not None:
+                vehicle._restore_position(state["accepted_position"])
+
+    async def _process_position_refreshes(self, force: bool) -> None:
+        """Run the bounded deferred position policy after selective status."""
+        if force or not self._position_state_store.usable:
+            return
+
+        detected_at = datetime.now(ZoneInfo("UTC")).isoformat()
+        for vehicle in self.vehicles:
+            odometer = vehicle.mileage
+            if isinstance(odometer, bool) or not isinstance(odometer, int) or odometer < 0:
+                continue
+            try:
+                should_fetch = self._position_state_store.observe(
+                    vehicle.vin,
+                    odometer,
+                    detected_at,
+                    current_position=vehicle._position,
+                )
+            except (PositionStateError, OSError, ValueError) as exc:
+                log.warning(
+                    "Parking-position state update failed for %s: %s",
+                    vehicle.vin[-4:],
+                    type(exc).__name__,
+                )
+                continue
+
+            if not should_fetch:
+                continue
+
+            try:
+                result = await vehicle._fetch_position_candidate()
+            except Exception as exc:
+                # The attempt was already claimed durably. Position failures
+                # must not fail an otherwise successful selective-status poll.
+                log.info(
+                    "Deferred parking-position request for %s failed (%s)",
+                    vehicle.vin[-4:],
+                    type(exc).__name__,
+                )
+                continue
+            if result.outcome != "success" or result.position is None:
+                if result.outcome == "rate_limited" and result.retry_not_before:
+                    try:
+                        self._position_state_store.defer_retry(
+                            vehicle.vin,
+                            result.retry_not_before,
+                        )
+                    except (PositionStateError, OSError, ValueError) as exc:
+                        log.info(
+                            "Parking-position retry deferral for %s failed (%s)",
+                            vehicle.vin[-4:],
+                            type(exc).__name__,
+                        )
+                log.info(
+                    "Deferred parking-position request for %s was not accepted (%s)",
+                    vehicle.vin[-4:],
+                    result.outcome,
+                )
+                continue
+            try:
+                accepted = self._position_state_store.accept(
+                    vehicle.vin,
+                    result.position,
+                    odometer,
+                )
+            except (PositionStateError, OSError, ValueError) as exc:
+                log.info(
+                    "Deferred parking-position candidate for %s was rejected (%s)",
+                    vehicle.vin[-4:],
+                    type(exc).__name__,
+                )
+                continue
+            vehicle._accept_position(accepted)
+
+    def _reconcile_legacy_position(
+        self,
+        vehicle: AudiVehicle,
+        update: LegacyPositionUpdate,
+    ) -> None:
+        """Merge a position already fetched by a legacy full update."""
+        position = update.position
+        if position is None or not self._position_state_store.usable:
+            return
+        try:
+            accepted = self._position_state_store.reconcile(
+                vehicle.vin,
+                position,
+                update.odometer,
+            )
+        except (PositionStateError, OSError, ValueError) as exc:
+            log.warning(
+                "Legacy parking-position reconciliation failed for %s (%s)",
+                vehicle.vin[-4:],
+                type(exc).__name__,
+            )
+            return
+        if accepted is not None:
+            vehicle._accept_position(accepted)
 
     async def update_vehicles(self, force: bool = False) -> None:
         """Update all vehicles data, respecting cache TTL."""
@@ -396,7 +521,8 @@ class AudiClient:
             log.info("Updating vehicle data%s...", " (forced)" if force else " (cache expired)")
             for vehicle in self.vehicles:
                 try:
-                    await vehicle.update()
+                    update = await vehicle.update(defer_position_acceptance=True)
+                    self._reconcile_legacy_position(vehicle, update)
                 except Exception as e:
                     log.error("Failed to update %s: %s", vehicle.vin, e)
             self._last_update = time.time()
@@ -438,6 +564,8 @@ class AudiClient:
 
                 for vehicle in self.vehicles:
                     await vehicle._fetch_vehicle_data(raise_on_error=True)
+
+            await self._process_position_refreshes(force=force)
 
             completed = time.time()
             self._last_live_poll = completed
@@ -571,7 +699,12 @@ async def _background_watcher() -> None:
             if not await client.ensure_auth():
                 continue
             await client.update_vehicles(force=True)
-            await check_vehicles(client.vehicles, prev_states, on_change=_on_change)
+            await check_vehicles(
+                client.vehicles,
+                prev_states,
+                on_change=_on_change,
+                refresh=False,
+            )
 
             # Goodnight check — fire once per day at the configured local hour.
             # The WATCH_INTERVAL (>=15min) is fine-grained enough that the

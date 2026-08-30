@@ -110,6 +110,9 @@ class AudiAuth:
     async def get_stored_position(self, vin: str) -> Optional[dict]:
         return await self.client.get_stored_position(vin)
 
+    async def get_parking_position_candidate(self, vin: str):
+        return await self.client.get_parking_position_candidate(vin)
+
     async def get_tripdata(self, vin: str, kind: str) -> dict:
         return await self.client.get_tripdata(vin, kind)
 

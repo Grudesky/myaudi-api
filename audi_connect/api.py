@@ -183,11 +183,12 @@ class AudiAPI:
         raw_reply: bool = False,
         raw_contents: bool = False,
         rsp_wtxt: bool = False,
+        session: Optional[ClientSession] = None,
         **kwargs: Any,
     ) -> Union[dict, bytes, ClientResponse, tuple[ClientResponse, str]]:
         try:
             async with asyncio.timeout(TIMEOUT):
-                async with self._session.request(
+                async with (session or self._session).request(
                     method, url, headers=headers, data=data, **kwargs
                 ) as response:
                     if raw_reply:
@@ -228,6 +229,50 @@ class AudiAPI:
             METH_GET, url, data=None, headers=headers,
             raw_reply=raw_reply, raw_contents=raw_contents, **kwargs,
         )
+
+    async def get_once(self, url: str, **kwargs: Any) -> Any:
+        """Perform exactly one GET attempt when caller-managed retry is required."""
+        return await self.request_once(
+            METH_GET,
+            url,
+            data=None,
+            headers=self._get_headers(),
+            **kwargs,
+        )
+
+    async def get_single_transmission(self, url: str, **kwargs: Any) -> Any:
+        """Perform one GET without aiohttp's transparent connection replay.
+
+        aiohttp retries idempotent methods once after selected pooled-connection
+        failures. It does not expose a public per-request switch for that replay,
+        so use an isolated session sharing the existing connector and cookie jar.
+        Disabling the session flag here cannot affect unrelated API traffic.
+        """
+        connector = self._session.connector
+        if connector is None:
+            raise RuntimeError("HTTP connector is unavailable")
+        session = ClientSession(
+            connector=connector,
+            connector_owner=False,
+            cookie_jar=self._session.cookie_jar,
+            trust_env=self._session.trust_env,
+        )
+        try:
+            # aiohttp 3.13 has no public equivalent. Fail closed if its internal
+            # replay control is no longer available rather than risk a replay.
+            if not hasattr(session, "_retry_connection"):
+                raise RuntimeError("aiohttp replay control is unavailable")
+            session._retry_connection = False
+            return await self._request_once(
+                METH_GET,
+                url,
+                data=None,
+                headers=self._get_headers(),
+                session=session,
+                **kwargs,
+            )
+        finally:
+            await session.close()
 
     def _get_headers(self) -> dict[str, str]:
         data = {

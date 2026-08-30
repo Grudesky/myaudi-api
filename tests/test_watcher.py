@@ -123,3 +123,13 @@ class TestCheckVehicles:
         await check_vehicles([vehicle], prev_states)
 
         assert prev_states["WAUTEST"]["locked"] == "Locked"
+
+    @pytest.mark.asyncio
+    async def test_pre_refreshed_state_does_not_issue_duplicate_update(self):
+        vehicle = self._make_vehicle()
+        prev_states = {}
+
+        await check_vehicles([vehicle], prev_states, refresh=False)
+
+        vehicle.update.assert_not_awaited()
+        assert prev_states["WAUTEST"]["locked"] == "Locked"

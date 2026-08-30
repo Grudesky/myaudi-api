@@ -39,6 +39,31 @@ server intentionally has no container-filesystem default: without this setting,
 engine endpoints fail closed with 503. A pod recreation must preserve this file
 or the at-most-once crash guard cannot be guaranteed.
 
+Set `AUDI_POSITION_STATE_FILE` to a file on the same persistent volume (for
+example `/data/position-state.json`). It stores only accepted coordinates,
+their CARIAD timestamp, and odometer-trigger state. This restores last-known
+position after restart and prevents a pending automatic position lookup from
+being repeated merely because the process restarted.
+
+### Golem LaunchAgent deployment
+
+Audi Monitor starts this API as a subprocess and passes values from:
+
+```text
+/Users/admin/myAudi/config/.env
+```
+
+For the Golem Mac mini, add this unquoted line to that file:
+
+```env
+AUDI_POSITION_STATE_FILE=/Users/admin/myAudi/state/position-state.json
+```
+
+`/Users/admin/myAudi/state` must be writable by the `admin` service account.
+The API creates the directory when needed and writes the state file with
+owner-only permissions. Values in this `.env` file override matching variables
+inherited from the LaunchAgent when Audi Monitor launches the API subprocess.
+
 Engine control must also be explicitly enabled per VIN with the comma-separated
 `AUDI_ENGINE_CONTROL_VINS` environment variable. For this deployment:
 

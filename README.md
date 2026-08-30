@@ -91,6 +91,7 @@ AUDI_WEBHOOK_URL=https://n8n.example.com/webhook/audi
 | `AUDI_WEBHOOK_SECRET` | If set, webhooks are signed with HMAC-SHA256 in the `X-Audi-Signature` header | (optional) |
 | `AUDI_WATCH_INTERVAL` | Background poll interval in seconds (API server only) | `0` (disabled) |
 | `AUDI_LIVE_POLL_MIN_INTERVAL` | Minimum interval between normal live `/status` polls | `900` (15 min) |
+| `AUDI_POSITION_STATE_FILE` | Durable last-known parking position and deferred odometer-trigger state | `~/.myaudi-api/position-state.json` |
 | `AUDI_ENGINE_ACTION_STATE_FILE` | Path on a durable volume for secret-free unresolved engine-action state; engine REST commands fail closed when unset | (required for engine REST commands) |
 | `AUDI_CACHE_TTL` | Data cache TTL in seconds | `14400` (4h) |
 | `AUDI_API_KEY` | Required header `X-API-Key` on all endpoints except `/health`, `/ready`, `/metrics`. Set to a strong random token. | (optional but **strongly recommended**) |

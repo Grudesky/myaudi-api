@@ -2,7 +2,9 @@
 
 import json
 import logging
+from dataclasses import dataclass
 from datetime import timedelta, datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Optional
 
 from .api import AudiAPI
@@ -10,6 +12,38 @@ from .endpoints import AudiEndpoints
 from .exceptions import AuthenticationError
 
 _LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ParkingPositionResult:
+    """Structured result for a single candidate parking-position request."""
+
+    outcome: str
+    position: Optional[dict] = None
+    http_status: Optional[int] = None
+    error_type: Optional[str] = None
+    retry_not_before: Optional[str] = None
+
+
+def _retry_not_before(value: Optional[str]) -> Optional[str]:
+    """Convert an HTTP Retry-After value to an absolute UTC timestamp."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    value = value.strip()
+    now = datetime.now(timezone.utc)
+    try:
+        seconds = int(value)
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        return retry_at.astimezone(timezone.utc).isoformat()
+    if seconds < 0:
+        return None
+    return (now + timedelta(seconds=seconds)).isoformat()
 
 
 class AudiVehicleClient:
@@ -108,6 +142,58 @@ class AudiVehicleClient:
             )
         except Exception:
             return None
+
+    async def get_parking_position_candidate(self, vin: str) -> ParkingPositionResult:
+        """Fetch one candidate while preserving meaningful HTTP outcomes.
+
+        This deliberately uses the non-retrying transport entry point. The
+        deferred state machine permits one automatic request per movement.
+        """
+        self._api.use_token(self._bearer_token)
+        try:
+            response, body = await self._api.get_single_transmission(
+                self._endpoints.cariad_url_for_vin(vin, "parkingposition"),
+                allow_redirects=False,
+                rsp_wtxt=True,
+            )
+        except Exception as exc:
+            return ParkingPositionResult(
+                outcome="transport_error",
+                error_type=type(exc).__name__,
+            )
+
+        status = response.status
+        if status == 200:
+            try:
+                position = json.loads(body)
+            except (json.JSONDecodeError, TypeError):
+                return ParkingPositionResult(
+                    outcome="invalid_response",
+                    http_status=status,
+                )
+            if not isinstance(position, dict):
+                return ParkingPositionResult(
+                    outcome="invalid_response",
+                    http_status=status,
+                )
+            return ParkingPositionResult(
+                outcome="success",
+                position=position,
+                http_status=status,
+            )
+        if status == 204:
+            return ParkingPositionResult(outcome="unavailable", http_status=status)
+        if status == 404:
+            return ParkingPositionResult(outcome="unsupported", http_status=status)
+        if status == 429:
+            return ParkingPositionResult(
+                outcome="rate_limited",
+                http_status=status,
+                retry_not_before=_retry_not_before(response.headers.get("Retry-After")),
+            )
+        if status >= 500:
+            return ParkingPositionResult(outcome="server_error", http_status=status)
+        return ParkingPositionResult(outcome="http_error", http_status=status)
 
     async def get_tripdata(self, vin: str, kind: str) -> dict:
         """Fetch trip statistics (short-term or long-term)."""

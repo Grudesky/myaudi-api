@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from dataclasses import dataclass
 import uuid
 from typing import Optional
 
@@ -21,9 +22,19 @@ from .exceptions import (
 )
 from .engine_actions import EngineActionStore, validate_request_id
 from .models import VehicleDataResponse, TripDataResponse, LockState, DoorState, WindowState
+from .position_state import newer_position
 from .utils import parse_int, parse_float
 
 _LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class LegacyPositionUpdate:
+    """A legacy position candidate and its contemporaneous odometer, if any."""
+
+    position: Optional[dict]
+    odometer: Optional[int]
+
 
 # Retry config for IDEMPOTENT vehicle actions only (lock, climate-stop,
 # heater-stop). End state is the same whether applied once or N times.
@@ -95,13 +106,13 @@ class AudiVehicle:
                 # recovery operation will fail closed through the unusable store.
                 self._engine_action_state_error = True
 
-    async def update(self) -> None:
+    async def update(self, defer_position_acceptance: bool = False) -> LegacyPositionUpdate:
         """Fetch all vehicle data from the API in parallel."""
         _LOGGER.info("Updating data for %s (%s)...", self.title or self.vin, self.vin[-4:])
 
         results = await asyncio.gather(
             self._fetch_vehicle_data(),
-            self._fetch_position(),
+            self._fetch_position(accept=not defer_position_acceptance),
             self._fetch_trip("shortTerm"),
             self._fetch_trip("longTerm"),
             return_exceptions=True,
@@ -109,27 +120,56 @@ class AudiVehicle:
         for i, result in enumerate(results):
             if isinstance(result, Exception):
                 _LOGGER.error("Fetch task %d failed: %s", i, result)
+        position_result = results[1]
+        position = position_result if isinstance(position_result, dict) else None
+        status_succeeded = results[0] is True
+        return LegacyPositionUpdate(
+            position=position,
+            odometer=self.mileage if status_succeeded else None,
+        )
 
-    async def _fetch_vehicle_data(self, raise_on_error: bool = False) -> None:
+    async def _fetch_vehicle_data(self, raise_on_error: bool = False) -> bool:
         try:
             raw_data = await self._auth.get_stored_vehicle_data(self.vin)
             self._raw_vehicle_data = raw_data
             self._vehicle_data = VehicleDataResponse(raw_data)
+            return True
         except Exception as e:
             _LOGGER.error("Failed to get vehicle data: %s", e)
             if raise_on_error:
                 raise
+            return False
 
-    async def _fetch_position(self) -> None:
+    async def _fetch_position(self, accept: bool = True) -> Optional[dict]:
         try:
-            self._position = await self._auth.get_stored_position(self.vin)
+            candidate = await self._auth.get_stored_position(self.vin)
+            accepted = newer_position(candidate, self._position)
+            if accepted is not None and accept:
+                self._position = accepted
             self._position_failed = False
             self._position_fetched = True
+            return accepted
         except Exception as e:
             _LOGGER.debug("Failed to get position (may be moving): %s", e)
-            self._position = None
             self._position_failed = True
             self._position_fetched = True
+            return None
+
+    async def _fetch_position_candidate(self):
+        """Return a structured candidate without changing accepted position."""
+        return await self._auth.get_parking_position_candidate(self.vin)
+
+    def _restore_position(self, position: dict) -> None:
+        """Restore a previously accepted position without an upstream request."""
+        self._position = position
+        self._position_failed = False
+        self._position_fetched = True
+
+    def _accept_position(self, position: dict) -> None:
+        """Install a candidate after durable validation and persistence."""
+        self._position = position
+        self._position_failed = False
+        self._position_fetched = True
 
     async def _fetch_trip(self, kind: str) -> None:
         try:
@@ -188,6 +228,11 @@ class AudiVehicle:
     def mileage(self) -> Optional[int]:
         field = self._get_field("UTC_TIME_AND_KILOMETER_STATUS")
         return parse_int(field.value) if field else None
+
+    @property
+    def mileage_timestamp(self) -> Optional[str]:
+        field = self._get_field("UTC_TIME_AND_KILOMETER_STATUS")
+        return field.measure_time if field else None
 
     @property
     def range_km(self) -> Optional[int]:

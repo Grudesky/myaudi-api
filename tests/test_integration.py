@@ -4,7 +4,9 @@ These tests exercise the real code path from AudiVehicleClient/AudiVehicleAction
 through AudiAPI down to the HTTP layer, with only the network mocked.
 """
 
+import asyncio
 import json
+from datetime import datetime, timedelta, timezone
 import pytest
 import pytest_asyncio
 import aiohttp
@@ -176,6 +178,106 @@ class TestClientIntegration:
             result = await client.get_stored_position("wautest")
 
         assert result is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("status", "body", "outcome"),
+        [
+            (204, "", "unavailable"),
+            (404, "", "unsupported"),
+            (429, "", "rate_limited"),
+            (502, "", "server_error"),
+            (302, "", "http_error"),
+            (200, "not json", "invalid_response"),
+        ],
+    )
+    async def test_parking_position_candidate_preserves_http_semantics(
+        self,
+        client,
+        status,
+        body,
+        outcome,
+    ):
+        url = "https://emea.bff.cariad.digital/vehicle/v1/vehicles/WAUTEST/parkingposition"
+        with aioresponses() as m:
+            m.get(url, status=status, body=body)
+            result = await client.get_parking_position_candidate("wautest")
+
+        assert result.outcome == outcome
+        assert result.http_status == status
+        assert sum(len(calls) for calls in m.requests.values()) == 1
+
+    @pytest.mark.asyncio
+    async def test_parking_position_candidate_success_is_structured(self, client):
+        url = "https://emea.bff.cariad.digital/vehicle/v1/vehicles/WAUTEST/parkingposition"
+        position = {
+            "data": {
+                "lat": 50.8503,
+                "lon": 4.3517,
+                "carCapturedTimestamp": "2026-08-30T12:00:00Z",
+            }
+        }
+        with aioresponses() as m:
+            m.get(url, payload=position)
+            result = await client.get_parking_position_candidate("wautest")
+
+        assert result.outcome == "success"
+        assert result.position == position
+        assert sum(len(calls) for calls in m.requests.values()) == 1
+
+    @pytest.mark.asyncio
+    async def test_parking_position_candidate_parses_retry_after(self, client):
+        url = "https://emea.bff.cariad.digital/vehicle/v1/vehicles/WAUTEST/parkingposition"
+        before = datetime.now(timezone.utc) + timedelta(seconds=3590)
+        with aioresponses() as m:
+            m.get(url, status=429, headers={"Retry-After": "3600"})
+            result = await client.get_parking_position_candidate("wautest")
+
+        assert result.outcome == "rate_limited"
+        assert datetime.fromisoformat(result.retry_not_before) >= before
+        assert sum(len(calls) for calls in m.requests.values()) == 1
+
+    @pytest.mark.asyncio
+    async def test_parking_position_candidate_transport_failure_is_not_retried(self, client):
+        url = "https://emea.bff.cariad.digital/vehicle/v1/vehicles/WAUTEST/parkingposition"
+        with aioresponses() as m:
+            m.get(url, exception=asyncio.TimeoutError())
+            result = await client.get_parking_position_candidate("wautest")
+
+        assert result.outcome == "transport_error"
+        assert result.error_type == "RequestTimeoutError"
+        assert sum(len(calls) for calls in m.requests.values()) == 1
+
+    @pytest.mark.asyncio
+    async def test_parking_position_candidate_disables_aiohttp_connection_replay(
+        self,
+        client,
+        monkeypatch,
+    ):
+        observed = {}
+
+        async def inspect_request_once(method, url, data, *, session, **kwargs):
+            observed["method"] = method
+            observed["retry_connection"] = session._retry_connection
+            observed["connector"] = session.connector
+            observed["connector_owner"] = session._connector_owner
+            observed["redirects"] = kwargs["allow_redirects"]
+            return type("Response", (), {"status": 204, "headers": {}})(), ""
+
+        monkeypatch.setattr(client._api, "_request_once", inspect_request_once)
+
+        result = await client.get_parking_position_candidate("wautest")
+
+        assert result.outcome == "unavailable"
+        assert observed == {
+            "method": "GET",
+            "retry_connection": False,
+            "connector": client._api._session.connector,
+            "connector_owner": False,
+            "redirects": False,
+        }
+        assert client._api._session._retry_connection is True
+        assert client._api._session.connector.closed is False
 
 
 class TestActionsIntegration:

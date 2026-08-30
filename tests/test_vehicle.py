@@ -24,7 +24,7 @@ def _http_error(status: int = 500) -> ClientResponseError:
 def _make_auth_mock():
     auth = AsyncMock()
     auth.get_stored_vehicle_data = AsyncMock(return_value={})
-    auth.get_stored_position = AsyncMock(return_value={"lat": 50.0, "lon": 4.0, "carCapturedTimestamp": "2024-01-01"})
+    auth.get_stored_position = AsyncMock(return_value={"lat": 50.0, "lon": 4.0, "carCapturedTimestamp": "2024-01-01T00:00:00Z"})
     auth.get_tripdata = AsyncMock(return_value={})
     auth.start_climate_control = AsyncMock()
     auth.stop_climate_control = AsyncMock()
@@ -124,6 +124,62 @@ class TestIsMoving:
         assert v.is_moving is False
         assert v._position_failed is True
 
+    @pytest.mark.asyncio
+    async def test_none_position_result_preserves_last_known_position(self):
+        auth = _make_auth_mock()
+        auth.get_stored_position = AsyncMock(return_value=None)
+        v = _make_vehicle(auth=auth)
+        v._restore_position({
+            "lat": 50.0,
+            "lon": 4.0,
+            "carCapturedTimestamp": "2026-08-01T12:00:00Z",
+        })
+
+        result = await v._fetch_position()
+
+        assert result is None
+        assert v.position["timestamp"] == "2026-08-01T12:00:00Z"
+
+    @pytest.mark.asyncio
+    async def test_stale_position_result_preserves_last_known_position(self):
+        auth = _make_auth_mock()
+        auth.get_stored_position = AsyncMock(return_value={
+            "lat": 49.0,
+            "lon": 3.0,
+            "carCapturedTimestamp": "2026-07-31T12:00:00Z",
+        })
+        v = _make_vehicle(auth=auth)
+        v._restore_position({
+            "lat": 50.0,
+            "lon": 4.0,
+            "carCapturedTimestamp": "2026-08-01T12:00:00Z",
+        })
+
+        result = await v._fetch_position()
+
+        assert result is None
+        assert v.position["latitude"] == 50.0
+
+    @pytest.mark.asyncio
+    async def test_deferred_position_candidate_does_not_change_memory(self):
+        auth = _make_auth_mock()
+        auth.get_stored_position = AsyncMock(return_value={
+            "lat": 51.0,
+            "lon": 5.0,
+            "carCapturedTimestamp": "2026-08-02T12:00:00Z",
+        })
+        v = _make_vehicle(auth=auth)
+        v._restore_position({
+            "lat": 50.0,
+            "lon": 4.0,
+            "carCapturedTimestamp": "2026-08-01T12:00:00Z",
+        })
+
+        result = await v._fetch_position(accept=False)
+
+        assert result["lat"] == 51.0
+        assert v.position["latitude"] == 50.0
+
 
 class TestParallelUpdate:
     """Tests that update() fetches data in parallel."""
@@ -183,13 +239,35 @@ class TestParallelUpdate:
     async def test_update_continues_on_partial_failure(self):
         auth = _make_auth_mock()
         auth.get_stored_vehicle_data = AsyncMock(side_effect=Exception("fail"))
-        auth.get_stored_position = AsyncMock(return_value={"lat": 50.0, "lon": 4.0, "carCapturedTimestamp": "t"})
+        auth.get_stored_position = AsyncMock(return_value={"lat": 50.0, "lon": 4.0, "carCapturedTimestamp": "2024-01-01T00:00:00Z"})
         v = _make_vehicle(auth=auth)
         await v.update()
 
         # Position should still be fetched despite vehicle data failure
         assert v._position is not None
         assert v._vehicle_data is None
+
+    @pytest.mark.asyncio
+    async def test_deferred_update_does_not_pair_position_with_stale_odometer(self):
+        auth = _make_auth_mock()
+        auth.get_stored_vehicle_data = AsyncMock(side_effect=Exception("fail"))
+        auth.get_stored_position = AsyncMock(return_value={
+            "lat": 51.0,
+            "lon": 5.0,
+            "carCapturedTimestamp": "2026-08-02T12:00:00Z",
+        })
+        v = _make_vehicle(auth=auth)
+        v._restore_position({
+            "lat": 50.0,
+            "lon": 4.0,
+            "carCapturedTimestamp": "2026-08-01T12:00:00Z",
+        })
+
+        update = await v.update(defer_position_acceptance=True)
+
+        assert update.position["lat"] == 51.0
+        assert update.odometer is None
+        assert v.position["latitude"] == 50.0
 
 
 class TestSafeTripParsing:
