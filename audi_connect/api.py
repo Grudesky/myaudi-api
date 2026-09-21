@@ -216,6 +216,7 @@ class AudiAPI:
                             response.history,
                             status=response.status,
                             message=response.reason,
+                            headers=response.headers,
                         )
                         error.safe_response_body = safe_body_summary
                         raise error

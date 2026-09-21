@@ -112,3 +112,25 @@ def test_status_live_request_fetches_selective_status_only(
     vehicle._fetch_vehicle_data.assert_awaited_once_with(raise_on_error=True)
     vehicle._fetch_position.assert_not_awaited()
     vehicle._fetch_trip.assert_not_awaited()
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 429, 500, 502, 503, 504])
+@pytest.mark.parametrize("force", [False, True])
+def test_status_preserves_upstream_http_error(status_client, monkeypatch, status, force):
+    error = api_module.ClientResponseError(
+        request_info=MagicMock(), history=(), status=status,
+        message="Upstream failure", headers={"Retry-After": "120"},
+    )
+    vehicle = MagicMock()
+    vehicle._fetch_vehicle_data = AsyncMock(side_effect=error)
+    monkeypatch.setattr(api_module.client, "vehicles", [vehicle])
+    monkeypatch.setattr(api_module.client, "_last_live_poll", 0.0)
+    response = status_client.get(
+        "/status?force=true" if force else "/status",
+        headers={"X-API-Key": "test-key"},
+    )
+    assert response.status_code == status
+    assert response.json() == {"detail": f"Audi upstream HTTP {status}"}
+    assert response.headers["Retry-After"] == "120"
+    assert api_module.client._last_live_poll == 0.0
+    assert vehicle._fetch_vehicle_data.await_count == (2 if status == 401 else 1)

@@ -344,3 +344,15 @@ class TestAPIRetry:
             result = await api.get("https://example.com/test")
 
         assert result["recovered"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [429, 502, 503])
+async def test_http_error_preserves_status_and_retry_after(api, status):
+    url = "https://example.invalid/selectivestatus"
+    with aioresponses() as mocked:
+        mocked.get(url, status=status, headers={"Retry-After": "120"})
+        with pytest.raises(aiohttp.ClientResponseError) as caught:
+            await api.get(url)
+    assert caught.value.status == status
+    assert caught.value.headers["Retry-After"] == "120"

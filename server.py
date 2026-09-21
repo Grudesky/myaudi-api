@@ -876,7 +876,21 @@ async def get_status(
 ):
     await _require_auth()
 
-    updated, retry_after = await client.live_update_vehicles(force=force)
+    try:
+        updated, retry_after = await client.live_update_vehicles(force=force)
+    except ClientResponseError as exc:
+        # Preserve Audi's HTTP outcome at the service boundary. Do not expose
+        # the exception string, which includes the vehicle-specific URL.
+        if not 400 <= exc.status <= 599:
+            raise
+        headers = {}
+        if exc.headers and exc.headers.get("Retry-After") is not None:
+            headers["Retry-After"] = exc.headers["Retry-After"]
+        return JSONResponse(
+            status_code=exc.status,
+            headers=headers,
+            content={"detail": f"Audi upstream HTTP {exc.status}"},
+        )
 
     if not updated:
         retry_after_seconds = max(1, int(retry_after + 0.999))
