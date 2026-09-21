@@ -130,7 +130,41 @@ def test_status_preserves_upstream_http_error(status_client, monkeypatch, status
         headers={"X-API-Key": "test-key"},
     )
     assert response.status_code == status
-    assert response.json() == {"detail": f"Audi upstream HTTP {status}"}
+    assert response.json() == {
+        "detail": f"Audi upstream HTTP {status}",
+        "upstream_requested": True,
+    }
     assert response.headers["Retry-After"] == "120"
     assert api_module.client._last_live_poll == 0.0
     assert vehicle._fetch_vehicle_data.await_count == (2 if status == 401 else 1)
+
+
+@pytest.mark.parametrize("failure", ["missing_key", "unconfigured_key", "authentication"])
+def test_local_status_auth_errors_do_not_claim_upstream_poll(status_client, monkeypatch, failure):
+    update = AsyncMock()
+    monkeypatch.setattr(api_module.client, "live_update_vehicles", update)
+    headers = {"X-API-Key": "test-key"}
+    expected = 503
+    if failure == "missing_key":
+        headers = {}
+        expected = 401
+    elif failure == "unconfigured_key":
+        monkeypatch.setattr(api_module, "AUDI_API_KEY", "")
+    else:
+        monkeypatch.setattr(api_module.client, "ensure_auth", AsyncMock(return_value=False))
+    response = status_client.get("/status", headers=headers)
+    assert response.status_code == expected
+    assert "upstream_requested" not in response.json()
+    update.assert_not_awaited()
+
+
+def test_unhandled_transport_error_does_not_claim_upstream_response(status_client, monkeypatch):
+    monkeypatch.setattr(
+        api_module.client, "live_update_vehicles",
+        AsyncMock(side_effect=ConnectionError("connection failed")),
+    )
+    response = TestClient(api_module.app, raise_server_exceptions=False).get(
+        "/status", headers={"X-API-Key": "test-key"},
+    )
+    assert response.status_code == 500
+    assert "upstream_requested" not in response.text

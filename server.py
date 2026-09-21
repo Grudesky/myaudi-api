@@ -889,7 +889,10 @@ async def get_status(
         return JSONResponse(
             status_code=exc.status,
             headers=headers,
-            content={"detail": f"Audi upstream HTTP {exc.status}"},
+            content={
+                "detail": f"Audi upstream HTTP {exc.status}",
+                "upstream_requested": True,
+            },
         )
 
     if not updated:

@@ -51,6 +51,12 @@ curl -H "X-API-Key: $AUDI_API_KEY" http://localhost:8000/vehicles
   (optional, bypasses the application live-poll cooldown; Audi upstream rate
   limits still apply).
 - Returns HTTP 200 with `{"status": "live", "live_poll_at": str, "count": int, "vehicles": [{"vin", "model", "title", **dashboard}]}` after a live Audi request.
+- When the live Audi request returns an HTTP error, preserves that HTTP status
+  and any `Retry-After` header, with
+  `{"detail": "Audi upstream HTTP <status>", "upstream_requested": true}`.
+  The Boolean field confirms an upstream attempt; the status code alone does
+  not. Missing provenance (including older API versions, local authentication
+  errors, and unhandled transport errors) leaves the upstream attempt unknown.
 - Returns HTTP 429 with `reason: "live_poll_cooldown"`, `Retry-After`,
   `last_live_poll`, `next_live_poll`, and `retry_after_seconds` when a normal
   request arrives before the live-poll cooldown expires. The default cooldown
